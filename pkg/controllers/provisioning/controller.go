@@ -58,7 +58,7 @@ func (c *PodController) Reconcile(ctx context.Context, p *v1.Pod) (reconcile.Res
 	if !pod.IsProvisionable(p) {
 		return reconcile.Result{}, nil
 	}
-	c.provisioner.Trigger()
+	c.provisioner.Trigger(p.UID)
 	// Continue to requeue until the pod is no longer provisionable. Pods may
 	// not be scheduled as expected if new pods are created while nodes are
 	// coming online. Even if a provisioning loop is successful, the pod may
@@ -101,7 +101,7 @@ func (c *NodeController) Reconcile(ctx context.Context, n *v1.Node) (reconcile.R
 	if !lo.Contains(n.Spec.Taints, v1beta1.DisruptionNoScheduleTaint) {
 		return reconcile.Result{}, nil
 	}
-	c.provisioner.Trigger()
+	c.provisioner.Trigger(n.UID)
 	// Continue to requeue until the node is no longer provisionable. Pods may
 	// not be scheduled as expected if new pods are created while nodes are
 	// coming online. Even if a provisioning loop is successful, the pod may

@@ -20,38 +20,42 @@ import (
 	"context"
 	"time"
 
+	"k8s.io/apimachinery/pkg/util/sets"
+
 	"sigs.k8s.io/karpenter/pkg/operator/options"
 )
 
 // Batcher separates a stream of Trigger() calls into windowed slices. The
 // window is dynamic and will be extended if additional items are added up to a
 // maximum batch duration.
-type Batcher struct {
-	trigger chan struct{}
+type Batcher[T comparable] struct {
+	trigger chan T
 }
 
 // NewBatcher is a constructor for the Batcher
-func NewBatcher() *Batcher {
-	return &Batcher{
-		trigger: make(chan struct{}, 1),
+func NewBatcher[T comparable]() *Batcher[T] {
+	return &Batcher[T]{
+		trigger: make(chan T, 1),
 	}
 }
 
 // Trigger causes the batcher to start a batching window, or extend the current batching window if it hasn't reached the
 // maximum length.
-func (b *Batcher) Trigger() {
+func (b *Batcher[T]) Trigger(triggeredOn T) {
 	// The trigger is idempotently armed. This statement never blocks
 	select {
-	case b.trigger <- struct{}{}:
+	case b.trigger <- triggeredOn:
 	default:
 	}
 }
 
 // Wait starts a batching window and continues waiting as long as it continues receiving triggers within
 // the idleDuration, up to the maxDuration
-func (b *Batcher) Wait(ctx context.Context) bool {
+func (b *Batcher[T]) Wait(ctx context.Context) bool {
+	triggeredOnElems := sets.New[T]()
 	select {
-	case <-b.trigger:
+	case triggeredOn := <-b.trigger:
+		triggeredOnElems.Insert(triggeredOn)
 		// start the batching window after the first item is received
 	case <-time.After(1 * time.Second):
 		// If no pods, bail to the outer controller framework to refresh the context
@@ -61,12 +65,16 @@ func (b *Batcher) Wait(ctx context.Context) bool {
 	idle := time.NewTimer(options.FromContext(ctx).BatchIdleDuration)
 	for {
 		select {
-		case <-b.trigger:
-			// correct way to reset an active timer per docs
-			if !idle.Stop() {
-				<-idle.C
+		case triggeredOn := <-b.trigger:
+			// Ensure we don't re-trigger when we just get the same item triggering us multiple times
+			if !triggeredOnElems.Has(triggeredOn) {
+				// correct way to reset an active timer per docs
+				if !idle.Stop() {
+					<-idle.C
+				}
+				idle.Reset(options.FromContext(ctx).BatchIdleDuration)
 			}
-			idle.Reset(options.FromContext(ctx).BatchIdleDuration)
+			triggeredOnElems.Insert(triggeredOn)
 		case <-timeout.C:
 			return true
 		case <-idle.C:

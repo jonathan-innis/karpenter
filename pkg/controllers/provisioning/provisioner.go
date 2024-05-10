@@ -80,7 +80,7 @@ func WithReason(reason string) func(LaunchOptions) LaunchOptions {
 type Provisioner struct {
 	cloudProvider  cloudprovider.CloudProvider
 	kubeClient     client.Client
-	batcher        *Batcher
+	batcher        *Batcher[types.UID]
 	volumeTopology *scheduler.VolumeTopology
 	cluster        *state.Cluster
 	recorder       events.Recorder
@@ -91,7 +91,7 @@ func NewProvisioner(kubeClient client.Client, recorder events.Recorder,
 	cloudProvider cloudprovider.CloudProvider, cluster *state.Cluster,
 ) *Provisioner {
 	p := &Provisioner{
-		batcher:        NewBatcher(),
+		batcher:        NewBatcher[types.UID](),
 		cloudProvider:  cloudProvider,
 		kubeClient:     kubeClient,
 		volumeTopology: scheduler.NewVolumeTopology(kubeClient),
@@ -102,8 +102,8 @@ func NewProvisioner(kubeClient client.Client, recorder events.Recorder,
 	return p
 }
 
-func (p *Provisioner) Trigger() {
-	p.batcher.Trigger()
+func (p *Provisioner) Trigger(uid types.UID) {
+	p.batcher.Trigger(uid)
 }
 
 func (p *Provisioner) Register(_ context.Context, m manager.Manager) error {
