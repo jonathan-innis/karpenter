@@ -17,6 +17,7 @@ limitations under the License.
 package scheduling
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"sync/atomic"
@@ -107,8 +108,9 @@ func (n *NodeClaim) Add(pod *v1.Pod, podRequests v1.ResourceList) error {
 
 	if len(filtered.remaining) == 0 {
 		// log the total resources being requested (daemonset + the pod)
-		cumulativeResources := resources.Merge(n.daemonResources, podRequests)
-		return fmt.Errorf("no instance type satisfied resources %s and requirements %s (%s)", resources.String(cumulativeResources), nodeClaimRequirements, filtered.FailureReason())
+		//cumulativeResources := resources.Merge(n.daemonResources, podRequests)
+		return errors.New(filtered.FailureReason())
+		//return fmt.Errorf("no instance type satisfied resources %s and requirements %s (%s)", resources.String(cumulativeResources), nodeClaimRequirements, filtered.FailureReason())
 	}
 
 	// Update node
