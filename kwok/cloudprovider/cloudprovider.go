@@ -51,16 +51,16 @@ type CloudProvider struct {
 }
 
 func (c CloudProvider) Create(ctx context.Context, nodeClaim *v1.NodeClaim) (*v1.NodeClaim, error) {
-	// Create the Node because KwoK nodes don't have a kubelet, which is what Karpenter normally relies on to create the node.
-	node, err := c.toNode(nodeClaim)
+	//Create the Node because KwoK nodes don't have a kubelet, which is what Karpenter normally relies on to create the node.
+	_, err := c.toNode(nodeClaim)
 	if err != nil {
 		return nil, fmt.Errorf("translating nodeclaim to node, %w", err)
 	}
-	if err := c.kubeClient.Create(ctx, node); err != nil {
-		return nil, fmt.Errorf("creating node, %w", err)
-	}
-	// convert the node back into a node claim to get the chosen resolved requirement values.
-	return c.toNodeClaim(node)
+	//if err := c.kubeClient.Create(ctx, node); err != nil {
+	//	return nil, fmt.Errorf("creating node, %w", err)
+	//}
+	// Hack the KWOK CloudProvider so that it returns back ICE errors every time
+	return nil, cloudprovider.NewInsufficientCapacityError(fmt.Errorf("mocked ICE error"))
 }
 
 func (c CloudProvider) Delete(ctx context.Context, nodeClaim *v1.NodeClaim) error {
