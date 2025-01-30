@@ -3,10 +3,10 @@ export KWOK_REPO ?= ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.co
 export KARPENTER_NAMESPACE=kube-system
 
 HELM_OPTS ?= --set logLevel=debug \
-			--set controller.resources.requests.cpu=1 \
-			--set controller.resources.requests.memory=1Gi \
-			--set controller.resources.limits.cpu=1 \
-			--set controller.resources.limits.memory=1Gi
+			--set controller.resources.requests.cpu=16 \
+			--set controller.resources.requests.memory=40Gi \
+			--set controller.resources.limits.cpu=16 \
+			--set controller.resources.limits.memory=40Gi
 
 help: ## Display help
 	@awk 'BEGIN {FS = ":.*##"; printf "Usage:\n  make \033[36m<target>\033[0m\n"} /^[a-zA-Z_0-9-]+:.*?##/ { printf "  \033[36m%-15s\033[0m %s\n", $$1, $$2 } /^##@/ { printf "\n\033[1m%s\033[0m\n", substr($$0, 5) } ' $(MAKEFILE_LIST)
