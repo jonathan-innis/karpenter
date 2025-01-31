@@ -65,7 +65,7 @@ func NewNodeClaim(nodeClaimTemplate *NodeClaimTemplate, topology *Topology, daem
 	}
 }
 
-func (n *NodeClaim) Add(pod *v1.Pod, podRequests v1.ResourceList) error {
+func (n *NodeClaim) Add(pod *v1.Pod, podData PodData) error {
 	// Check Taints
 	if err := scheduling.Taints(n.Spec.Taints).Tolerates(pod); err != nil {
 		return err
@@ -77,22 +77,15 @@ func (n *NodeClaim) Add(pod *v1.Pod, podRequests v1.ResourceList) error {
 		return fmt.Errorf("checking host port usage, %w", err)
 	}
 	nodeClaimRequirements := scheduling.NewRequirements(n.Requirements.Values()...)
-	podRequirements := scheduling.NewPodRequirements(pod)
 
 	// Check NodeClaim Affinity Requirements
-	if err := nodeClaimRequirements.Compatible(podRequirements, scheduling.AllowUndefinedWellKnownLabels); err != nil {
+	if err := nodeClaimRequirements.Compatible(podData.Requirements, scheduling.AllowUndefinedWellKnownLabels); err != nil {
 		return fmt.Errorf("incompatible requirements, %w", err)
 	}
-	nodeClaimRequirements.Add(podRequirements.Values()...)
+	nodeClaimRequirements.Add(podData.Requirements.Values()...)
 
-	strictPodRequirements := podRequirements
-	if scheduling.HasPreferredNodeAffinity(pod) {
-		// strictPodRequirements is important as it ensures we don't inadvertently restrict the possible pod domains by a
-		// preferred node affinity.  Only required node affinities can actually reduce pod domains.
-		strictPodRequirements = scheduling.NewStrictPodRequirements(pod)
-	}
 	// Check Topology Requirements
-	topologyRequirements, err := n.topology.AddRequirements(strictPodRequirements, nodeClaimRequirements, pod, scheduling.AllowUndefinedWellKnownLabels)
+	topologyRequirements, err := n.topology.AddRequirements(podData.StrictRequirements, nodeClaimRequirements, pod, scheduling.AllowUndefinedWellKnownLabels)
 	if err != nil {
 		return err
 	}
@@ -102,7 +95,7 @@ func (n *NodeClaim) Add(pod *v1.Pod, podRequests v1.ResourceList) error {
 	nodeClaimRequirements.Add(topologyRequirements.Values()...)
 
 	// Check instance type combinations
-	requests := resources.Merge(n.Spec.Resources.Requests, podRequests)
+	requests := resources.Merge(n.Spec.Resources.Requests, podData.Requests)
 
 	filtered := filterInstanceTypesByRequirements(n.InstanceTypeOptions, nodeClaimRequirements, requests)
 
