@@ -75,7 +75,8 @@ func (c *Controller) Reconcile(ctx context.Context, nodePool *v1.NodePool) (reco
 	// We need to ensure that our internal cluster state mechanism is synced before we proceed
 	// Otherwise, we have the potential to patch over the status with a lower value for the nodepool resource
 	// counts on startup
-	if !c.cluster.Synced(ctx) {
+	// We use HasSynced instead of Synced here because we really only care to wait here until the cluster state is initially hydrated
+	if !c.cluster.HasSynced() {
 		return reconcile.Result{RequeueAfter: time.Second}, nil
 	}
 	stored := nodePool.DeepCopy()
