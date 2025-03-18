@@ -20,12 +20,11 @@ import (
 	"context"
 
 	"github.com/awslabs/operatorpkg/controller"
-	"github.com/awslabs/operatorpkg/object"
 	"github.com/awslabs/operatorpkg/status"
-	"github.com/samber/lo"
 	"k8s.io/utils/clock"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
+	"sigs.k8s.io/karpenter/pkg/controllers/metrics/aggregation"
 
 	corev1 "k8s.io/api/core/v1"
 
@@ -99,9 +98,10 @@ func NewControllers(
 		nodeclaimdisruption.NewController(clock, kubeClient, cloudProvider),
 		nodeclaimhydration.NewController(kubeClient, cloudProvider),
 		nodehydration.NewController(kubeClient, cloudProvider),
-		status.NewController[*v1.NodeClaim](kubeClient, mgr.GetEventRecorderFor("karpenter"), status.EmitDeprecatedMetrics, status.WithLabels(append(lo.Map(cloudProvider.GetSupportedNodeClasses(), func(obj status.Object, _ int) string { return v1.NodeClassLabelKey(object.GVK(obj).GroupKind()) }), v1.NodePoolLabelKey)...)),
+		status.NewController[*v1.NodeClaim](kubeClient, mgr.GetEventRecorderFor("karpenter"), status.EmitDeprecatedMetrics),
 		status.NewController[*v1.NodePool](kubeClient, mgr.GetEventRecorderFor("karpenter"), status.EmitDeprecatedMetrics),
-		status.NewGenericObjectController[*corev1.Node](kubeClient, mgr.GetEventRecorderFor("karpenter"), status.WithLabels(append(lo.Map(cloudProvider.GetSupportedNodeClasses(), func(obj status.Object, _ int) string { return v1.NodeClassLabelKey(object.GVK(obj).GroupKind()) }), v1.NodePoolLabelKey, v1.NodeInitializedLabelKey)...)),
+		status.NewGenericObjectController[*corev1.Node](kubeClient, mgr.GetEventRecorderFor("karpenter")),
+		aggregation.NewController(kubeClient, cloudProvider),
 	}
 
 	// The cloud provider must define status conditions for the node repair controller to use to detect unhealthy nodes
