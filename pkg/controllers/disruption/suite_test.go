@@ -27,6 +27,8 @@ import (
 	"k8s.io/client-go/util/workqueue"
 	clockiface "k8s.io/utils/clock"
 
+	provisioningdynamic "sigs.k8s.io/karpenter/pkg/controllers/provisioning/dynamic"
+
 	"sigs.k8s.io/karpenter/pkg/events"
 	"sigs.k8s.io/karpenter/pkg/metrics"
 
@@ -49,7 +51,6 @@ import (
 	"sigs.k8s.io/karpenter/pkg/cloudprovider/fake"
 	"sigs.k8s.io/karpenter/pkg/controllers/disruption"
 	"sigs.k8s.io/karpenter/pkg/controllers/disruption/orchestration"
-	"sigs.k8s.io/karpenter/pkg/controllers/provisioning"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/controllers/state/informer"
 	"sigs.k8s.io/karpenter/pkg/operator/options"
@@ -65,7 +66,7 @@ var ctx context.Context
 var env *test.Environment
 var cluster *state.Cluster
 var disruptionController *disruption.Controller
-var prov *provisioning.Provisioner
+var prov *provisioningdynamic.Controller
 var cloudProvider *fake.CloudProvider
 var nodeStateController *informer.NodeController
 var nodeClaimStateController *informer.NodeClaimController
@@ -96,8 +97,8 @@ var _ = BeforeSuite(func() {
 	nodeStateController = informer.NewNodeController(env.Client, cluster)
 	nodeClaimStateController = informer.NewNodeClaimController(env.Client, cloudProvider, cluster)
 	recorder = test.NewEventRecorder()
-	prov = provisioning.NewProvisioner(env.Client, recorder, cloudProvider, cluster, fakeClock)
-	queue = NewTestingQueue(env.Client, recorder, cluster, fakeClock, prov)
+	prov = provisioningdynamic.NewController(env.Client, recorder, cloudProvider, cluster, fakeClock)
+	queue = NewTestingQueue(env.Client, recorder, cluster, fakeClock)
 	disruptionController = disruption.NewController(fakeClock, env.Client, prov, cloudProvider, recorder, cluster, queue)
 })
 
@@ -117,7 +118,7 @@ var _ = BeforeEach(func() {
 	}
 	fakeClock.SetTime(time.Now())
 	cluster.Reset()
-	*queue = lo.FromPtr(NewTestingQueue(env.Client, recorder, cluster, fakeClock, prov))
+	*queue = lo.FromPtr(NewTestingQueue(env.Client, recorder, cluster, fakeClock))
 	cluster.MarkUnconsolidated()
 
 	// Reset Feature Flags to test defaults
@@ -389,12 +390,12 @@ var _ = Describe("Simulate Scheduling", func() {
 		ss := test.StatefulSet()
 		ExpectApplied(ctx, env.Client, ss)
 
-		// StorageClass that references "no-provisioner" and is used for local volume storage
+		// StorageClass that references "no-controller" and is used for local volume storage
 		storageClass := test.StorageClass(test.StorageClassOptions{
 			ObjectMeta: metav1.ObjectMeta{
 				Name: "local-path",
 			},
-			Provisioner: lo.ToPtr("kubernetes.io/no-provisioner"),
+			Provisioner: lo.ToPtr("kubernetes.io/no-controller"),
 		})
 		persistentVolume := test.PersistentVolume(test.PersistentVolumeOptions{UseLocal: true})
 		persistentVolume.Spec.NodeAffinity = &corev1.VolumeNodeAffinity{
@@ -2205,10 +2206,9 @@ func ExpectMakeNewNodeClaimsReady(ctx context.Context, c client.Client, wg *sync
 	}()
 }
 
-func NewTestingQueue(kubeClient client.Client, recorder events.Recorder, cluster *state.Cluster, clock clockiface.Clock,
-	provisioner *provisioning.Provisioner) *orchestration.Queue {
+func NewTestingQueue(kubeClient client.Client, recorder events.Recorder, cluster *state.Cluster, clock clockiface.Clock) *orchestration.Queue {
 
-	q := orchestration.NewQueue(kubeClient, recorder, cluster, clock, provisioner)
+	q := orchestration.NewQueue(kubeClient, recorder, cluster, clock)
 	q.TypedRateLimitingInterface = test.NewTypedRateLimitingInterface[*orchestration.Command](workqueue.TypedQueueConfig[*orchestration.Command]{Name: "disruption.workqueue"})
 	return q
 }

@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package provisioning
+package dynamic
 
 import (
 	"context"
@@ -36,17 +36,17 @@ import (
 
 // PodController for the resource
 type PodController struct {
-	kubeClient  client.Client
-	provisioner *Provisioner
-	cluster     *state.Cluster
+	kubeClient client.Client
+	controller *Controller
+	cluster    *state.Cluster
 }
 
 // NewPodController constructs a controller instance
-func NewPodController(kubeClient client.Client, provisioner *Provisioner, cluster *state.Cluster) *PodController {
+func NewPodController(kubeClient client.Client, controller *Controller, cluster *state.Cluster) *PodController {
 	return &PodController{
-		kubeClient:  kubeClient,
-		provisioner: provisioner,
-		cluster:     cluster,
+		kubeClient: kubeClient,
+		controller: controller,
+		cluster:    cluster,
 	}
 }
 
@@ -57,7 +57,7 @@ func (c *PodController) Reconcile(ctx context.Context, p *corev1.Pod) (reconcile
 	if !pod.IsProvisionable(p) {
 		return reconcile.Result{}, nil
 	}
-	c.provisioner.Trigger(p.UID)
+	c.controller.Trigger(p.UID)
 	// ACK the pending pod when first observed so that total time spent pending due to Karpenter is tracked.
 	c.cluster.AckPods(p)
 	// Continue to requeue until the pod is no longer provisionable. Pods may
@@ -77,15 +77,15 @@ func (c *PodController) Register(_ context.Context, m manager.Manager) error {
 
 // NodeController for the resource
 type NodeController struct {
-	kubeClient  client.Client
-	provisioner *Provisioner
+	kubeClient client.Client
+	controller *Controller
 }
 
 // NewNodeController constructs a controller instance
-func NewNodeController(kubeClient client.Client, provisioner *Provisioner) *NodeController {
+func NewNodeController(kubeClient client.Client, controller *Controller) *NodeController {
 	return &NodeController{
-		kubeClient:  kubeClient,
-		provisioner: provisioner,
+		kubeClient: kubeClient,
+		controller: controller,
 	}
 }
 
@@ -102,7 +102,7 @@ func (c *NodeController) Reconcile(ctx context.Context, n *corev1.Node) (reconci
 	}) {
 		return reconcile.Result{}, nil
 	}
-	c.provisioner.Trigger(n.UID)
+	c.controller.Trigger(n.UID)
 	// Continue to requeue until the node is no longer provisionable. Pods may
 	// not be scheduled as expected if new pods are created while nodes are
 	// coming online. Even if a provisioning loop is successful, the pod may
