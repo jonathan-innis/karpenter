@@ -36,6 +36,8 @@ type NodePoolStatus struct {
 	// Resources is the list of resources that have been provisioned.
 	// +optional
 	Resources v1.ResourceList `json:"resources,omitempty"`
+	// Nodes is a count of nodes associated with this NodePool
+	Nodes int64 `json:"nodes"`
 	// NodeClassObservedGeneration represents the observed nodeClass generation for referenced nodeClass. If this does not match
 	// the actual NodeClass Generation, NodeRegistrationHealthy status condition on the NodePool will be reset
 	// +optional

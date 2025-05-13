@@ -104,6 +104,13 @@ func NewCluster(clk clock.Clock, client client.Client, cloudProvider cloudprovid
 	}
 }
 
+// HasSynced returns whether we have ever synced our cluster state
+// This is useful for controllers that only need to ensure that they wait for the first
+// cluster sync and then can have eventual consistency after that point
+func (c *Cluster) HasSynced() bool {
+	return c.hasSynced.Load()
+}
+
 // Synced validates that the NodeClaims and the Nodes that are stored in the apiserver
 // have the same representation in the cluster state. This is to ensure that our view
 // of the cluster is as close to correct as it can be when we begin to perform operations

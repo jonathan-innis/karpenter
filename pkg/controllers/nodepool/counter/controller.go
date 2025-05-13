@@ -75,15 +75,18 @@ func (c *Controller) Reconcile(ctx context.Context, nodePool *v1.NodePool) (reco
 	// We need to ensure that our internal cluster state mechanism is synced before we proceed
 	// Otherwise, we have the potential to patch over the status with a lower value for the nodepool resource
 	// counts on startup
-	if !c.cluster.Synced(ctx) {
+	if !c.cluster.HasSynced() {
 		return reconcile.Result{RequeueAfter: time.Second}, nil
 	}
 	stored := nodePool.DeepCopy()
 	// Determine resource usage and update nodepool.status.resources
 	nodePool.Status.Resources = lo.Assign(BaseResources, c.cluster.NodePoolResourcesFor(nodePool.Name))
+	nodeQuantity := nodePool.Status.Resources[resources.Node]
+	nodePool.Status.Nodes = nodeQuantity.Value()
+	delete(nodePool.Status.Resources, resources.Node)
 	if !equality.Semantic.DeepEqual(stored, nodePool) {
-		if err := c.kubeClient.Status().Patch(ctx, nodePool, client.MergeFrom(stored)); err != nil {
-			return reconcile.Result{}, client.IgnoreNotFound(err)
+		if err := c.kubeClient.Status().Patch(ctx, nodePool, client.MergeFrom(stored)); client.IgnoreNotFound(err) != nil {
+			return reconcile.Result{}, err
 		}
 	}
 	return reconcile.Result{RequeueAfter: time.Second * 5}, nil
@@ -93,9 +96,10 @@ func (c *Controller) Register(_ context.Context, m manager.Manager) error {
 	return controllerruntime.NewControllerManagedBy(m).
 		Named("nodepool.counter").
 		For(&v1.NodePool{}, builder.WithPredicates(nodepoolutils.IsManagedPredicateFuncs(c.cloudProvider), predicate.Funcs{
-			CreateFunc: func(e event.CreateEvent) bool { return true },
-			UpdateFunc: func(e event.UpdateEvent) bool { return false },
-			DeleteFunc: func(e event.DeleteEvent) bool { return false },
+			CreateFunc:  func(e event.CreateEvent) bool { return true },
+			UpdateFunc:  func(e event.UpdateEvent) bool { return false },
+			DeleteFunc:  func(e event.DeleteEvent) bool { return false },
+			GenericFunc: func(e event.GenericEvent) bool { return false },
 		})).
 		WithOptions(controller.Options{MaxConcurrentReconciles: 10}).
 		Complete(reconcile.AsReconciler(m.GetClient(), c))

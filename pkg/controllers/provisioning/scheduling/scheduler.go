@@ -122,6 +122,11 @@ func NewScheduler(
 	// if any of the nodePools add a taint with a prefer no schedule effect, we add a toleration for the taint
 	// during preference relaxation
 	toleratePreferNoSchedule := false
+
+	// Split up the static NodePools and the standard NodePools so that we can simulate static capacity being created
+	staticNodePools, nodePools := lo.FilterReject(nodePools, func(np *v1.NodePool, _ int) bool {
+		return np.Spec.Replicas != nil
+	})
 	for _, np := range nodePools {
 		for _, taint := range np.Spec.Template.Spec.Taints {
 			if taint.Effect == corev1.TaintEffectPreferNoSchedule {
@@ -161,6 +166,7 @@ func NewScheduler(
 		numConcurrentReconciles: lo.Ternary(option.Resolve(opts...).numConcurrentReconciles > 0, option.Resolve(opts...).numConcurrentReconciles, 1),
 	}
 	s.calculateExistingNodeClaims(stateNodes, daemonSetPods)
+	s.calculateStaticNodeClaims(staticNodePools)
 	return s
 }
 
@@ -437,7 +443,6 @@ func (s *Scheduler) add(ctx context.Context, pod *corev1.Pod) error {
 	}
 	// Consider using https://pkg.go.dev/container/heap
 	sort.Slice(s.newNodeClaims, func(a, b int) bool { return len(s.newNodeClaims[a].Pods) < len(s.newNodeClaims[b].Pods) })
-
 	// Pick existing node that we are about to create
 	if err := s.addToInflightNode(ctx, pod); err == nil {
 		return nil
@@ -634,6 +639,20 @@ func (s *Scheduler) calculateExistingNodeClaims(stateNodes []*state.StateNode, d
 		}
 		return s.existingNodes[i].Name() < s.existingNodes[j].Name()
 	})
+}
+
+func (s *Scheduler) calculateStaticNodeClaims(staticNodePools []*v1.NodePool) {
+	nodePoolToNodeMap := lo.GroupBy(s.existingNodes, func(n *ExistingNode) string { return n.Labels()[v1.NodePoolLabelKey] })
+	for _, nodePool := range staticNodePools {
+		nodeClaimCount := int64(len(nodePoolToNodeMap[nodePool.Name])) - lo.FromPtr(nodePool.Spec.Replicas)
+		nct := NewNodeClaimTemplate(nodePool)
+		for range nodeClaimCount {
+			// TODO: Eventually we should support scoping down the instance type options here by limits
+			nc := NewNodeClaim(nct, s.topology, s.daemonOverhead[nct], s.daemonHostPortUsage[nct], nct.InstanceTypeOptions, s.reservationManager, s.reservedOfferingMode)
+			nc.IsStaticNode = true
+			s.newNodeClaims = append(s.newNodeClaims, nc)
+		}
+	}
 }
 
 // parallelizeUntil is an implementation of workqueue.ParallelizeUntil that modifies the

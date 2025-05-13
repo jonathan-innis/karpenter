@@ -44,12 +44,13 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	"sigs.k8s.io/controller-runtime/pkg/source"
 
+	"sigs.k8s.io/karpenter/pkg/controllers/provisioning"
+
 	pscheduling "sigs.k8s.io/karpenter/pkg/controllers/provisioning/scheduling"
 	operatorlogging "sigs.k8s.io/karpenter/pkg/operator/logging"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	disruptionevents "sigs.k8s.io/karpenter/pkg/controllers/disruption/events"
-	"sigs.k8s.io/karpenter/pkg/controllers/provisioning"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/events"
 	"sigs.k8s.io/karpenter/pkg/metrics"
@@ -92,9 +93,7 @@ type Queue struct {
 }
 
 // NewQueue creates a queue that will asynchronously orchestrate disruption commands
-func NewQueue(kubeClient client.Client, recorder events.Recorder, cluster *state.Cluster, clock clock.Clock,
-	provisioner *provisioning.Provisioner,
-) *Queue {
+func NewQueue(kubeClient client.Client, recorder events.Recorder, cluster *state.Cluster, clock clock.Clock) *Queue {
 	queue := &Queue{
 		// nolint:staticcheck
 		// We need to implement a deprecated interface since Command currently doesn't implement "comparable"
@@ -104,7 +103,7 @@ func NewQueue(kubeClient client.Client, recorder events.Recorder, cluster *state
 		recorder:            recorder,
 		cluster:             cluster,
 		clock:               clock,
-		provisioner:         provisioner,
+		provisioner:         provisioning.NewProvisioner(kubeClient, recorder, cluster),
 	}
 	return queue
 }

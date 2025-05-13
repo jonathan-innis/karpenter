@@ -74,12 +74,14 @@ func NewNodeClaimTemplate(nodePool *v1.NodePool) *NodeClaimTemplate {
 }
 
 func (i *NodeClaimTemplate) ToNodeClaim() *v1.NodeClaim {
-	// Order the instance types by price and only take the first 100 of them to decrease the instance type size in the requirements
-	instanceTypes := lo.Slice(i.InstanceTypeOptions.OrderByPrice(i.Requirements), 0, MaxInstanceTypes)
-	i.Requirements.Add(scheduling.NewRequirementWithFlexibility(corev1.LabelInstanceTypeStable, corev1.NodeSelectorOpIn, i.Requirements.Get(corev1.LabelInstanceTypeStable).MinValues, lo.Map(instanceTypes, func(i *cloudprovider.InstanceType, _ int) string {
-		return i.Name
-	})...))
-
+	// Only add the instance type requirement if we have instance type options
+	if len(i.InstanceTypeOptions) > 0 {
+		// Order the instance types by price and only take the first 100 of them to decrease the instance type size in the requirements
+		instanceTypes := lo.Slice(i.InstanceTypeOptions.OrderByPrice(i.Requirements), 0, MaxInstanceTypes)
+		i.Requirements.Add(scheduling.NewRequirementWithFlexibility(corev1.LabelInstanceTypeStable, corev1.NodeSelectorOpIn, i.Requirements.Get(corev1.LabelInstanceTypeStable).MinValues, lo.Map(instanceTypes, func(i *cloudprovider.InstanceType, _ int) string {
+			return i.Name
+		})...))
+	}
 	nc := &v1.NodeClaim{
 		ObjectMeta: metav1.ObjectMeta{
 			GenerateName: fmt.Sprintf("%s-", i.NodePoolName),
@@ -101,6 +103,5 @@ func (i *NodeClaimTemplate) ToNodeClaim() *v1.NodeClaim {
 	if nc.Spec.TerminationGracePeriod == nil {
 		nc.Spec.TerminationGracePeriod = DefaultTerminationGracePeriod
 	}
-
 	return nc
 }

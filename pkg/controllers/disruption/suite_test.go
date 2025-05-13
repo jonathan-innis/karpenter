@@ -25,6 +25,8 @@ import (
 	"testing"
 	"time"
 
+	"sigs.k8s.io/karpenter/pkg/controllers/provisioning"
+	provisioningdynamic "sigs.k8s.io/karpenter/pkg/controllers/provisioning/dynamic"
 	pscheduling "sigs.k8s.io/karpenter/pkg/controllers/provisioning/scheduling"
 
 	"sigs.k8s.io/karpenter/pkg/metrics"
@@ -47,7 +49,6 @@ import (
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider/fake"
 	"sigs.k8s.io/karpenter/pkg/controllers/disruption"
-	"sigs.k8s.io/karpenter/pkg/controllers/provisioning"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/controllers/state/informer"
 	"sigs.k8s.io/karpenter/pkg/operator/options"
@@ -63,7 +64,7 @@ var ctx context.Context
 var env *test.Environment
 var cluster *state.Cluster
 var disruptionController *disruption.Controller
-var prov *provisioning.Provisioner
+var prov *provisioningdynamic.Controller
 var cloudProvider *fake.CloudProvider
 var nodeStateController *informer.NodeController
 var nodeClaimStateController *informer.NodeClaimController
@@ -382,12 +383,12 @@ var _ = Describe("Simulate Scheduling", func() {
 		ss := test.StatefulSet()
 		ExpectApplied(ctx, env.Client, ss)
 
-		// StorageClass that references "no-provisioner" and is used for local volume storage
+		// StorageClass that references "no-controller" and is used for local volume storage
 		storageClass := test.StorageClass(test.StorageClassOptions{
 			ObjectMeta: metav1.ObjectMeta{
 				Name: "local-path",
 			},
-			Provisioner: lo.ToPtr("kubernetes.io/no-provisioner"),
+			Provisioner: lo.ToPtr("kubernetes.io/no-controller"),
 		})
 		persistentVolume := test.PersistentVolume(test.PersistentVolumeOptions{UseLocal: true})
 		persistentVolume.Spec.NodeAffinity = &corev1.VolumeNodeAffinity{

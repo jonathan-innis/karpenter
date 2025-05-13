@@ -28,6 +28,8 @@ import (
 
 	"k8s.io/utils/clock/testing"
 
+	provisioningdynamic "sigs.k8s.io/karpenter/pkg/controllers/provisioning/dynamic"
+
 	opmetrics "github.com/awslabs/operatorpkg/metrics"
 	"github.com/awslabs/operatorpkg/singleton"
 	"github.com/awslabs/operatorpkg/status"
@@ -299,9 +301,9 @@ func ExpectFinalizersRemoved(ctx context.Context, c client.Client, objs ...clien
 	}
 }
 
-func ExpectProvisioned(ctx context.Context, c client.Client, cluster *state.Cluster, cloudProvider cloudprovider.CloudProvider, provisioner *provisioning.Provisioner, pods ...*corev1.Pod) Bindings {
+func ExpectProvisioned(ctx context.Context, c client.Client, cluster *state.Cluster, cloudProvider cloudprovider.CloudProvider, controller *provisioningdynamic.Controller, pods ...*corev1.Pod) Bindings {
 	GinkgoHelper()
-	bindings := ExpectProvisionedNoBinding(ctx, c, cluster, cloudProvider, provisioner, pods...)
+	bindings := ExpectProvisionedNoBinding(ctx, c, cluster, cloudProvider, controller, pods...)
 	podKeys := sets.NewString(lo.Map(pods, func(p *corev1.Pod, _ int) string { return client.ObjectKeyFromObject(p).String() })...)
 	for pod, binding := range bindings {
 		// Only bind the pods that are passed through
@@ -314,14 +316,14 @@ func ExpectProvisioned(ctx context.Context, c client.Client, cluster *state.Clus
 }
 
 //nolint:gocyclo
-func ExpectProvisionedNoBinding(ctx context.Context, c client.Client, cluster *state.Cluster, cloudProvider cloudprovider.CloudProvider, provisioner *provisioning.Provisioner, pods ...*corev1.Pod) Bindings {
+func ExpectProvisionedNoBinding(ctx context.Context, c client.Client, cluster *state.Cluster, cloudProvider cloudprovider.CloudProvider, controller *provisioningdynamic.Controller, pods ...*corev1.Pod) Bindings {
 	GinkgoHelper()
 	// Persist objects
 	for _, pod := range pods {
 		ExpectApplied(ctx, c, pod)
 	}
 	// TODO: Check the error on the provisioner scheduling round
-	results, err := provisioner.Schedule(ctx)
+	results, err := controller.Schedule(ctx)
 	bindings := Bindings{}
 	if err != nil {
 		log.Printf("error provisioning in test, %s", err)
@@ -329,6 +331,7 @@ func ExpectProvisionedNoBinding(ctx context.Context, c client.Client, cluster *s
 	}
 	for _, m := range results.NewNodeClaims {
 		// TODO: Check the error on the provisioner launch
+		provisioner := provisioning.NewProvisioner(c, test.NewEventRecorder(), cluster)
 		nodeClaimName, err := provisioner.Create(ctx, m, provisioning.WithReason(metrics.ProvisionedReason))
 		if err != nil {
 			return bindings

@@ -20,7 +20,7 @@ spec:
         - jsonPath: .spec.template.spec.nodeClassRef.name
           name: NodeClass
           type: string
-        - jsonPath: .status.resources.nodes
+        - jsonPath: .status.nodes
           name: Nodes
           type: string
         - jsonPath: .status.conditions[?(@.type=="Ready")].status
@@ -167,6 +167,12 @@ spec:
                     x-kubernetes-int-or-string: true
                   description: Limits define a set of bounds for provisioning capacity.
                   type: object
+                replicas:
+                  description: |-
+                    Replicas is the desired number of NodeClaims to create from this NodePool
+                    Not setting this value means that you want Karpenter to use this NodePool for auto-provisioning
+                  format: int64
+                  type: integer
                 template:
                   description: |-
                     Template contains the template of possibilities for the provisioning logic to launch a NodeClaim with.
@@ -504,6 +510,10 @@ spec:
                     the actual NodeClass Generation, NodeRegistrationHealthy status condition on the NodePool will be reset
                   format: int64
                   type: integer
+                nodes:
+                  description: Nodes is a count of nodes associated with this NodePool
+                  format: int64
+                  type: integer
                 resources:
                   additionalProperties:
                     anyOf:
@@ -513,6 +523,8 @@ spec:
                     x-kubernetes-int-or-string: true
                   description: Resources is the list of resources that have been provisioned.
                   type: object
+              required:
+                - nodes
               type: object
           required:
             - spec
@@ -520,4 +532,7 @@ spec:
       served: true
       storage: true
       subresources:
+        scale:
+          specReplicasPath: .spec.replicas
+          statusReplicasPath: .status.nodes
         status: {}

@@ -413,6 +413,11 @@ func (in *NodePoolList) DeepCopyObject() runtime.Object {
 func (in *NodePoolSpec) DeepCopyInto(out *NodePoolSpec) {
 	*out = *in
 	in.Template.DeepCopyInto(&out.Template)
+	if in.Replicas != nil {
+		in, out := &in.Replicas, &out.Replicas
+		*out = new(int64)
+		**out = **in
+	}
 	in.Disruption.DeepCopyInto(&out.Disruption)
 	if in.Limits != nil {
 		in, out := &in.Limits, &out.Limits
