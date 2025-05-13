@@ -41,6 +41,9 @@ type NodePoolSpec struct {
 	// NodeClaims launched from this NodePool will often be further constrained than the template specifies.
 	// +required
 	Template NodeClaimTemplate `json:"template"`
+	// Replicas is the desired number of NodeClaims to create from this NodePool
+	// Not setting this value means that you want Karpenter to use this NodePool for auto-provisioning
+	Replicas *int64 `json:"replicas,omitempty"`
 	// Disruption contains the parameters that relate to Karpenter's disruption logic
 	// +kubebuilder:default:={consolidateAfter: "0s"}
 	// +optional
@@ -133,9 +136,10 @@ const (
 type DisruptionReason string
 
 const (
-	DisruptionReasonUnderutilized DisruptionReason = "Underutilized"
-	DisruptionReasonEmpty         DisruptionReason = "Empty"
-	DisruptionReasonDrifted       DisruptionReason = "Drifted"
+	DisruptionReasonUnderutilized   DisruptionReason = "Underutilized"
+	DisruptionReasonEmpty           DisruptionReason = "Empty"
+	DisruptionReasonDrifted         DisruptionReason = "Drifted"
+	DisruptionReasonOverprovisioned DisruptionReason = "Overprovisioned"
 )
 
 type Limits v1.ResourceList
@@ -253,13 +257,15 @@ type ObjectMeta struct {
 // +kubebuilder:storageversion
 // +kubebuilder:resource:path=nodepools,scope=Cluster,categories=karpenter
 // +kubebuilder:printcolumn:name="NodeClass",type="string",JSONPath=".spec.template.spec.nodeClassRef.name",description=""
-// +kubebuilder:printcolumn:name="Nodes",type="string",JSONPath=".status.resources.nodes",description=""
+// +kubebuilder:printcolumn:name="Nodes",type="string",JSONPath=".status.nodes",description=""
 // +kubebuilder:printcolumn:name="Ready",type="string",JSONPath=".status.conditions[?(@.type==\"Ready\")].status",description=""
 // +kubebuilder:printcolumn:name="Age",type="date",JSONPath=".metadata.creationTimestamp",description=""
 // +kubebuilder:printcolumn:name="Weight",type="integer",JSONPath=".spec.weight",priority=1,description=""
 // +kubebuilder:printcolumn:name="CPU",type="string",JSONPath=".status.resources.cpu",priority=1,description=""
 // +kubebuilder:printcolumn:name="Memory",type="string",JSONPath=".status.resources.memory",priority=1,description=""
 // +kubebuilder:subresource:status
+// +kubebuilder:subresource:status
+// +kubebuilder:subresource:scale:specpath=.spec.replicas,statuspath=.status.nodes
 type NodePool struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`

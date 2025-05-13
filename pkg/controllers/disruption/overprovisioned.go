@@ -21,7 +21,10 @@ import (
 	"errors"
 	"sort"
 
+	"github.com/samber/lo"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	"sigs.k8s.io/karpenter/pkg/utils/resources"
 
 	provisioningdynamic "sigs.k8s.io/karpenter/pkg/controllers/provisioning/dynamic"
 
@@ -33,16 +36,16 @@ import (
 	"sigs.k8s.io/karpenter/pkg/events"
 )
 
-// Drift is a subreconciler that deletes drifted candidates.
-type Drift struct {
+// Overprovisioned is a subreconciler that deletes candidates that extend beyond a static NodePool's desired replicas.
+type Overprovisioned struct {
 	kubeClient client.Client
 	cluster    *state.Cluster
 	controller *provisioningdynamic.Controller
 	recorder   events.Recorder
 }
 
-func NewDrift(kubeClient client.Client, cluster *state.Cluster, controller *provisioningdynamic.Controller, recorder events.Recorder) *Drift {
-	return &Drift{
+func NewOverprovisioned(kubeClient client.Client, cluster *state.Cluster, controller *provisioningdynamic.Controller, recorder events.Recorder) *Overprovisioned {
+	return &Overprovisioned{
 		kubeClient: kubeClient,
 		cluster:    cluster,
 		controller: controller,
@@ -51,22 +54,25 @@ func NewDrift(kubeClient client.Client, cluster *state.Cluster, controller *prov
 }
 
 // ShouldDisrupt is a predicate used to filter candidates
-func (d *Drift) ShouldDisrupt(_ context.Context, c *Candidate) bool {
-	return c.NodeClaim.StatusConditions().Get(string(d.Reason())).IsTrue()
+func (o *Overprovisioned) ShouldDisrupt(_ context.Context, c *Candidate) bool {
+	if c.NodePool.Spec.Replicas == nil {
+		return false
+	}
+	nodeQuantity := o.cluster.NodePoolResourcesFor(c.NodePool.Name)[resources.Node]
+	return nodeQuantity.Value() > lo.FromPtr(c.NodePool.Spec.Replicas)
 }
 
 // ComputeCommand generates a disruption command given candidates
-func (d *Drift) ComputeCommand(ctx context.Context, disruptionBudgetMapping map[string]int, candidates ...*Candidate) (Command, error) {
+func (o *Overprovisioned) ComputeCommand(ctx context.Context, disruptionBudgetMapping map[string]int, candidates ...*Candidate) (Command, error) {
 	sort.Slice(candidates, func(i int, j int) bool {
-		return candidates[i].NodeClaim.StatusConditions().Get(string(d.Reason())).LastTransitionTime.Time.Before(
-			candidates[j].NodeClaim.StatusConditions().Get(string(d.Reason())).LastTransitionTime.Time)
+		return candidates[i].NodeClaim.CreationTimestamp.Before(&candidates[j].NodeClaim.CreationTimestamp)
 	})
 
 	for _, candidate := range candidates {
 		// Filter out empty candidates. If there was an empty node that wasn't consolidated before this, we should
 		// assume that it was due to budgets. If we don't filter out budgets, users who set a budget for `empty`
 		// can find their nodes disrupted here, which while that in itself isn't an issue for empty nodes, it could
-		// constrain the `drift` budget.
+		// constrain the `overpvoisioned` budget.
 		if len(candidate.reschedulablePods) == 0 {
 			continue
 		}
@@ -77,7 +83,7 @@ func (d *Drift) ComputeCommand(ctx context.Context, disruptionBudgetMapping map[
 			continue
 		}
 		// Check if we need to create any NodeClaims.
-		results, err := SimulateScheduling(ctx, d.kubeClient, d.cluster, d.controller, candidate)
+		results, err := SimulateScheduling(ctx, o.kubeClient, o.cluster, o.controller, candidate)
 		if err != nil {
 			// if a candidate is now deleting, just retry
 			if errors.Is(err, errCandidateDeleting) {
@@ -87,10 +93,9 @@ func (d *Drift) ComputeCommand(ctx context.Context, disruptionBudgetMapping map[
 		}
 		// Emit an event that we couldn't reschedule the pods on the node.
 		if !results.AllNonPendingPodsScheduled() {
-			d.recorder.Publish(disruptionevents.Blocked(candidate.Node, candidate.NodeClaim, pretty.Sentence(results.NonPendingPodSchedulingErrors()))...)
+			o.recorder.Publish(disruptionevents.Blocked(candidate.Node, candidate.NodeClaim, pretty.Sentence(results.NonPendingPodSchedulingErrors()))...)
 			continue
 		}
-
 		return Command{
 			Candidates:   []*Candidate{candidate},
 			Replacements: replacementsFromNodeClaims(results.NewNodeClaims...),
@@ -100,14 +105,14 @@ func (d *Drift) ComputeCommand(ctx context.Context, disruptionBudgetMapping map[
 	return Command{}, nil
 }
 
-func (d *Drift) Reason() v1.DisruptionReason {
-	return v1.DisruptionReasonDrifted
+func (o *Overprovisioned) Reason() v1.DisruptionReason {
+	return v1.DisruptionReasonOverprovisioned
 }
 
-func (d *Drift) Class() string {
+func (o *Overprovisioned) Class() string {
 	return EventualDisruptionClass
 }
 
-func (d *Drift) ConsolidationType() string {
+func (o *Overprovisioned) ConsolidationType() string {
 	return ""
 }
