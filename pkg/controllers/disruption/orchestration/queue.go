@@ -41,7 +41,6 @@ import (
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	disruptionevents "sigs.k8s.io/karpenter/pkg/controllers/disruption/events"
-	"sigs.k8s.io/karpenter/pkg/controllers/provisioning"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/events"
 	"sigs.k8s.io/karpenter/pkg/metrics"
@@ -136,16 +135,14 @@ type Queue struct {
 	mu                  sync.RWMutex
 	providerIDToCommand map[string]*Command // providerID -> command, maps a candidate to its command
 
-	kubeClient  client.Client
-	recorder    events.Recorder
-	cluster     *state.Cluster
-	clock       clock.Clock
-	provisioner *provisioning.Provisioner
+	kubeClient client.Client
+	recorder   events.Recorder
+	cluster    *state.Cluster
+	clock      clock.Clock
 }
 
 // NewQueue creates a queue that will asynchronously orchestrate disruption commands
 func NewQueue(kubeClient client.Client, recorder events.Recorder, cluster *state.Cluster, clock clock.Clock,
-	provisioner *provisioning.Provisioner,
 ) *Queue {
 	queue := &Queue{
 		// nolint:staticcheck
@@ -160,7 +157,6 @@ func NewQueue(kubeClient client.Client, recorder events.Recorder, cluster *state
 		recorder:            recorder,
 		cluster:             cluster,
 		clock:               clock,
-		provisioner:         provisioner,
 	}
 	return queue
 }
