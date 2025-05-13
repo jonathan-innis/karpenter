@@ -41,7 +41,6 @@ import (
 	"sigs.k8s.io/karpenter/pkg/cloudprovider/fake"
 	disruptionevents "sigs.k8s.io/karpenter/pkg/controllers/disruption/events"
 	"sigs.k8s.io/karpenter/pkg/controllers/disruption/orchestration"
-	"sigs.k8s.io/karpenter/pkg/controllers/provisioning"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/controllers/state/informer"
 	"sigs.k8s.io/karpenter/pkg/operator/options"
@@ -61,7 +60,6 @@ var nodeClaimStateController *informer.NodeClaimController
 var fakeClock *clock.FakeClock
 var recorder *test.EventRecorder
 var queue *orchestration.Queue
-var prov *provisioning.Provisioner
 
 var replacements []string
 var ncName string
@@ -85,8 +83,7 @@ var _ = BeforeSuite(func() {
 	nodeStateController = informer.NewNodeController(env.Client, cluster)
 	nodeClaimStateController = informer.NewNodeClaimController(env.Client, cloudProvider, cluster)
 	recorder = test.NewEventRecorder()
-	prov = provisioning.NewProvisioner(env.Client, recorder, cloudProvider, cluster, fakeClock)
-	queue = NewTestingQueue(env.Client, recorder, cluster, fakeClock, prov)
+	queue = NewTestingQueue(env.Client, recorder, cluster, fakeClock)
 })
 
 var _ = AfterSuite(func() {
@@ -94,7 +91,7 @@ var _ = AfterSuite(func() {
 })
 
 var _ = BeforeEach(func() {
-	*queue = lo.FromPtr(NewTestingQueue(env.Client, recorder, cluster, fakeClock, prov))
+	*queue = lo.FromPtr(NewTestingQueue(env.Client, recorder, cluster, fakeClock))
 	recorder.Reset() // Reset the events that we captured during the run
 	cluster.Reset()
 	cloudProvider.Reset()
@@ -359,10 +356,9 @@ var _ = Describe("Queue", func() {
 	})
 })
 
-func NewTestingQueue(kubeClient client.Client, recorder events.Recorder, cluster *state.Cluster, clock clockiface.Clock,
-	provisioner *provisioning.Provisioner) *orchestration.Queue {
+func NewTestingQueue(kubeClient client.Client, recorder events.Recorder, cluster *state.Cluster, clock clockiface.Clock) *orchestration.Queue {
 
-	q := orchestration.NewQueue(kubeClient, recorder, cluster, clock, provisioner)
+	q := orchestration.NewQueue(kubeClient, recorder, cluster, clock)
 	// nolint:staticcheck
 	// We need to implement a deprecated interface since Command currently doesn't implement "comparable"
 	q.TypedRateLimitingInterface = test.NewTypedRateLimitingInterface[*orchestration.Command](workqueue.TypedQueueConfig[*orchestration.Command]{Name: "disruption.workqueue"})

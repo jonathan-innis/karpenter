@@ -20,16 +20,18 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/samber/lo"
 	"k8s.io/utils/clock"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
+	provisioningdynamic "sigs.k8s.io/karpenter/pkg/controllers/provisioning/dynamic"
+
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/controllers/disruption/orchestration"
-	"sigs.k8s.io/karpenter/pkg/controllers/provisioning"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/events"
 )
@@ -62,7 +64,8 @@ type validation struct {
 	cluster       *state.Cluster
 	kubeClient    client.Client
 	cloudProvider cloudprovider.CloudProvider
-	provisioner   *provisioning.Provisioner
+	controller    *provisioningdynamic.Controller
+	once          sync.Once
 	recorder      events.Recorder
 	queue         *orchestration.Queue
 	reason        v1.DisruptionReason
@@ -81,7 +84,7 @@ func NewEmptinessValidator(c consolidation) *EmptinessValidator {
 			clock:         c.clock,
 			cluster:       c.cluster,
 			kubeClient:    c.kubeClient,
-			provisioner:   c.provisioner,
+			controller:    c.controller,
 			cloudProvider: c.cloudProvider,
 			recorder:      c.recorder,
 			queue:         c.queue,
@@ -114,7 +117,7 @@ func NewSingleConsolidationValidator(c consolidation) *ConsolidationValidator {
 			clock:         c.clock,
 			cluster:       c.cluster,
 			kubeClient:    c.kubeClient,
-			provisioner:   c.provisioner,
+			controller:    c.controller,
 			cloudProvider: c.cloudProvider,
 			recorder:      c.recorder,
 			queue:         c.queue,
@@ -132,7 +135,7 @@ func NewMultiConsolidationValidator(c consolidation) *ConsolidationValidator {
 			clock:         c.clock,
 			cluster:       c.cluster,
 			kubeClient:    c.kubeClient,
-			provisioner:   c.provisioner,
+			controller:    c.controller,
 			cloudProvider: c.cloudProvider,
 			recorder:      c.recorder,
 			queue:         c.queue,
@@ -255,7 +258,7 @@ func (v *validation) validateCommand(ctx context.Context, cmd Command, candidate
 	if len(candidates) == 0 {
 		return NewValidationError(fmt.Errorf("no candidates"))
 	}
-	results, err := SimulateScheduling(ctx, v.kubeClient, v.cluster, v.provisioner, candidates...)
+	results, err := SimulateScheduling(ctx, v.kubeClient, v.cluster, v.controller, candidates...)
 	if err != nil {
 		return fmt.Errorf("simluating scheduling, %w", err)
 	}
