@@ -39,6 +39,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
+	provisioningdynamic "sigs.k8s.io/karpenter/pkg/controllers/provisioning/dynamic"
+
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/controllers/disruption/orchestration"
@@ -57,6 +59,7 @@ type Controller struct {
 	queue         *orchestration.Queue
 	kubeClient    client.Client
 	cluster       *state.Cluster
+	controller    *provisioningdynamic.Controller
 	provisioner   *provisioning.Provisioner
 	recorder      events.Recorder
 	clock         clock.Clock
@@ -69,25 +72,28 @@ type Controller struct {
 // pollingPeriod that we inspect cluster to look for opportunities to disrupt
 const pollingPeriod = 10 * time.Second
 
-func NewController(clk clock.Clock, kubeClient client.Client, provisioner *provisioning.Provisioner,
+func NewController(clk clock.Clock, kubeClient client.Client, controller *provisioningdynamic.Controller,
 	cp cloudprovider.CloudProvider, recorder events.Recorder, cluster *state.Cluster, queue *orchestration.Queue,
 ) *Controller {
-	c := MakeConsolidation(clk, cluster, kubeClient, provisioner, cp, recorder, queue)
+	c := MakeConsolidation(clk, cluster, kubeClient, controller, cp, recorder, queue)
 
 	return &Controller{
 		queue:         queue,
 		clock:         clk,
 		kubeClient:    kubeClient,
 		cluster:       cluster,
-		provisioner:   provisioner,
+		controller:    controller,
+		provisioner:   provisioning.NewProvisioner(kubeClient, recorder, cluster),
 		recorder:      recorder,
 		cloudProvider: cp,
 		lastRun:       map[string]time.Time{},
 		methods: []Method{
 			// Delete any empty NodeClaims as there is zero cost in terms of disruption.
 			NewEmptiness(c),
+			// Terminate any NodeClaims that exceed the desired replicas for a NodePool
+			NewOverprovisioned(kubeClient, cluster, controller, recorder),
 			// Terminate any NodeClaims that have drifted from provisioning specifications, allowing the pods to reschedule.
-			NewDrift(kubeClient, cluster, provisioner, recorder),
+			NewDrift(kubeClient, cluster, controller, recorder),
 			// Attempt to identify multiple NodeClaims that we can consolidate simultaneously to reduce pod churn
 			NewMultiNodeConsolidation(c),
 			// And finally fall back our single NodeClaim consolidation to further reduce cluster cost.
