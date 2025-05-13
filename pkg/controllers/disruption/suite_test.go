@@ -28,6 +28,7 @@ import (
 	"k8s.io/client-go/util/workqueue"
 	clockiface "k8s.io/utils/clock"
 
+	provisioningdynamic "sigs.k8s.io/karpenter/pkg/controllers/provisioning/dynamic"
 	pscheduling "sigs.k8s.io/karpenter/pkg/controllers/provisioning/scheduling"
 
 	"sigs.k8s.io/karpenter/pkg/events"
@@ -51,7 +52,6 @@ import (
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider/fake"
 	"sigs.k8s.io/karpenter/pkg/controllers/disruption"
-	"sigs.k8s.io/karpenter/pkg/controllers/provisioning"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/controllers/state/informer"
 	"sigs.k8s.io/karpenter/pkg/operator/options"
@@ -67,7 +67,7 @@ var ctx context.Context
 var env *test.Environment
 var cluster *state.Cluster
 var disruptionController *disruption.Controller
-var prov *provisioning.Provisioner
+var prov *provisioningdynamic.Controller
 var cloudProvider *fake.CloudProvider
 var nodeStateController *informer.NodeController
 var nodeClaimStateController *informer.NodeClaimController
@@ -98,8 +98,8 @@ var _ = BeforeSuite(func() {
 	nodeStateController = informer.NewNodeController(env.Client, cluster)
 	nodeClaimStateController = informer.NewNodeClaimController(env.Client, cloudProvider, cluster)
 	recorder = test.NewEventRecorder()
-	prov = provisioning.NewProvisioner(env.Client, recorder, cloudProvider, cluster, fakeClock)
-	queue = NewTestingQueue(env.Client, recorder, cluster, fakeClock, prov)
+	prov = provisioningdynamic.NewController(env.Client, recorder, cloudProvider, cluster, fakeClock)
+	queue = NewTestingQueue(env.Client, recorder, cluster, fakeClock)
 	disruptionController = disruption.NewController(fakeClock, env.Client, prov, cloudProvider, recorder, cluster, queue)
 })
 
@@ -119,7 +119,7 @@ var _ = BeforeEach(func() {
 	}
 	fakeClock.SetTime(time.Now())
 	cluster.Reset()
-	*queue = lo.FromPtr(NewTestingQueue(env.Client, recorder, cluster, fakeClock, prov))
+	*queue = lo.FromPtr(NewTestingQueue(env.Client, recorder, cluster, fakeClock))
 	cluster.MarkUnconsolidated()
 
 	// Reset Feature Flags to test defaults
@@ -386,12 +386,12 @@ var _ = Describe("Simulate Scheduling", func() {
 		ss := test.StatefulSet()
 		ExpectApplied(ctx, env.Client, ss)
 
-		// StorageClass that references "no-provisioner" and is used for local volume storage
+		// StorageClass that references "no-controller" and is used for local volume storage
 		storageClass := test.StorageClass(test.StorageClassOptions{
 			ObjectMeta: metav1.ObjectMeta{
 				Name: "local-path",
 			},
-			Provisioner: lo.ToPtr("kubernetes.io/no-provisioner"),
+			Provisioner: lo.ToPtr("kubernetes.io/no-controller"),
 		})
 		persistentVolume := test.PersistentVolume(test.PersistentVolumeOptions{UseLocal: true})
 		persistentVolume.Spec.NodeAffinity = &corev1.VolumeNodeAffinity{
@@ -463,9 +463,8 @@ var _ = Describe("Simulate Scheduling", func() {
 		hangCreateClient := newHangCreateClient(env.Client)
 		defer hangCreateClient.Stop()
 
-		p := provisioning.NewProvisioner(hangCreateClient, recorder, cloudProvider, cluster, fakeClock)
-		q := NewTestingQueue(hangCreateClient, recorder, cluster, fakeClock, p)
-		dc := disruption.NewController(fakeClock, env.Client, p, cloudProvider, recorder, cluster, q)
+		q := NewTestingQueue(hangCreateClient, recorder, cluster, fakeClock)
+		dc := disruption.NewController(fakeClock, env.Client, prov, cloudProvider, recorder, cluster, q)
 
 		nodeClaim, node := test.NodeClaimAndNode(v1.NodeClaim{
 			ObjectMeta: metav1.ObjectMeta{
@@ -2270,10 +2269,9 @@ func ExpectMakeNewNodeClaimsReady(ctx context.Context, c client.Client, wg *sync
 	}()
 }
 
-func NewTestingQueue(kubeClient client.Client, recorder events.Recorder, cluster *state.Cluster, clock clockiface.Clock,
-	provisioner *provisioning.Provisioner) *disruption.Queue {
+func NewTestingQueue(kubeClient client.Client, recorder events.Recorder, cluster *state.Cluster, clock clockiface.Clock) *disruption.Queue {
 
-	q := disruption.NewQueue(kubeClient, recorder, cluster, clock, provisioner)
+	q := disruption.NewQueue(kubeClient, recorder, cluster, clock)
 	q.TypedRateLimitingInterface = test.NewTypedRateLimitingInterface[*disruption.Command](workqueue.TypedQueueConfig[*disruption.Command]{Name: "disruption.workqueue"})
 	return q
 }

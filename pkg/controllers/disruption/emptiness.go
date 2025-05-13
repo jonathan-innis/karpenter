@@ -21,7 +21,10 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/samber/lo"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+
+	"sigs.k8s.io/karpenter/pkg/utils/resources"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	disruptionevents "sigs.k8s.io/karpenter/pkg/controllers/disruption/events"
@@ -39,6 +42,10 @@ func NewEmptiness(c consolidation) *Emptiness {
 
 // ShouldDisrupt is a predicate used to filter candidates
 func (e *Emptiness) ShouldDisrupt(_ context.Context, c *Candidate) bool {
+	// Emptiness should be handled for static NodePools
+	if c.NodePool.Spec.Replicas != nil && len(c.reschedulablePods) == 0 {
+		return true
+	}
 	// If consolidation is disabled, don't do anything. This emptiness should run for both WhenEmpty and WhenEmptyOrUnderutilized
 	if c.NodePool.Spec.Disruption.ConsolidateAfter.Duration == nil {
 		e.recorder.Publish(disruptionevents.Unconsolidatable(c.Node, c.NodeClaim, fmt.Sprintf("NodePool %q has consolidation disabled", c.NodePool.Name))...)
@@ -59,6 +66,7 @@ func (e *Emptiness) ComputeCommand(ctx context.Context, disruptionBudgetMapping 
 
 	empty := make([]*Candidate, 0, len(candidates))
 	constrainedByBudgets := false
+	nodePoolDiffMapping := map[string]int{}
 	for _, candidate := range candidates {
 		if len(candidate.reschedulablePods) > 0 {
 			continue
@@ -68,10 +76,20 @@ func (e *Emptiness) ComputeCommand(ctx context.Context, disruptionBudgetMapping 
 			constrainedByBudgets = true
 			continue
 		}
+		if candidate.NodePool.Spec.Replicas != nil {
+			nodeQuantity := e.cluster.NodePoolResourcesFor(candidate.NodePool.Name)[resources.Node]
+			// If total number of current nodes for a NodePool minus the Nodes we are about to disrupt
+			// is less than or equal to the desired count, we shouldn't disrupt the empty node since we should
+			// maintain this static capacity to match the desired replicas on the NodePool
+			if lo.FromPtr(candidate.NodePool.Spec.Replicas) >= nodeQuantity.Value()+int64(nodePoolDiffMapping[candidate.NodePool.Name]) {
+				continue
+			}
+		}
 		// If there's disruptions allowed for the candidate's nodepool,
 		// add it to the list of candidates, and decrement the budget.
 		empty = append(empty, candidate)
 		disruptionBudgetMapping[candidate.NodePool.Name]--
+		nodePoolDiffMapping[candidate.NodePool.Name]--
 	}
 	// none empty, so do nothing
 	if len(empty) == 0 {
