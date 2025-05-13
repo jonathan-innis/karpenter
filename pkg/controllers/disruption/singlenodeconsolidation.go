@@ -56,7 +56,7 @@ func (s *SingleNodeConsolidation) ComputeCommand(ctx context.Context, disruption
 	}
 	candidates = s.SortCandidates(ctx, candidates)
 
-	v := NewValidation(s.clock, s.cluster, s.kubeClient, s.provisioner, s.cloudProvider, s.recorder, s.queue, s.Reason())
+	v := NewValidation(s.clock, s.cluster, s.kubeClient, s.controller, s.cloudProvider, s.recorder, s.queue, s.Reason())
 
 	// Set a timeout
 	timeout := s.clock.Now().Add(SingleNodeConsolidationTimeoutDuration)

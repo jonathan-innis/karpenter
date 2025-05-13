@@ -26,10 +26,11 @@ import (
 	"k8s.io/utils/clock"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
+	provisioningdynamic "sigs.k8s.io/karpenter/pkg/controllers/provisioning/dynamic"
+
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/controllers/disruption/orchestration"
-	"sigs.k8s.io/karpenter/pkg/controllers/provisioning"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/events"
 )
@@ -59,20 +60,20 @@ type Validation struct {
 	cluster       *state.Cluster
 	kubeClient    client.Client
 	cloudProvider cloudprovider.CloudProvider
-	provisioner   *provisioning.Provisioner
+	controller    *provisioningdynamic.Controller
 	once          sync.Once
 	recorder      events.Recorder
 	queue         *orchestration.Queue
 	reason        v1.DisruptionReason
 }
 
-func NewValidation(clk clock.Clock, cluster *state.Cluster, kubeClient client.Client, provisioner *provisioning.Provisioner,
+func NewValidation(clk clock.Clock, cluster *state.Cluster, kubeClient client.Client, controller *provisioningdynamic.Controller,
 	cp cloudprovider.CloudProvider, recorder events.Recorder, queue *orchestration.Queue, reason v1.DisruptionReason) *Validation {
 	return &Validation{
 		clock:         clk,
 		cluster:       cluster,
 		kubeClient:    kubeClient,
-		provisioner:   provisioner,
+		controller:    controller,
 		cloudProvider: cp,
 		recorder:      recorder,
 		queue:         queue,
@@ -158,7 +159,7 @@ func (v *Validation) ValidateCommand(ctx context.Context, cmd Command, candidate
 	if len(candidates) == 0 {
 		return NewValidationError(fmt.Errorf("no candidates"))
 	}
-	results, err := SimulateScheduling(ctx, v.kubeClient, v.cluster, v.provisioner, candidates...)
+	results, err := SimulateScheduling(ctx, v.kubeClient, v.cluster, v.controller, candidates...)
 	if err != nil {
 		return fmt.Errorf("simluating scheduling, %w", err)
 	}

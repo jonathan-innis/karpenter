@@ -45,11 +45,12 @@ import (
 	clock "k8s.io/utils/clock/testing"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
+	provisioningdynamic "sigs.k8s.io/karpenter/pkg/controllers/provisioning/dynamic"
+
 	"sigs.k8s.io/karpenter/pkg/apis"
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider/fake"
-	"sigs.k8s.io/karpenter/pkg/controllers/provisioning"
 	"sigs.k8s.io/karpenter/pkg/controllers/provisioning/scheduling"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/controllers/state/informer"
@@ -64,7 +65,7 @@ import (
 )
 
 var ctx context.Context
-var prov *provisioning.Provisioner
+var prov *provisioningdynamic.Controller
 var env *test.Environment
 var fakeClock *clock.FakeClock
 var cluster *state.Cluster
@@ -72,7 +73,7 @@ var cloudProvider *fake.CloudProvider
 var nodeStateController *informer.NodeController
 var nodeClaimStateController *informer.NodeClaimController
 var podStateController *informer.PodController
-var podController *provisioning.PodController
+var podController *provisioningdynamic.PodController
 
 const csiProvider = "fake.csi.provider"
 const isDefaultStorageClassAnnotation = "storageclass.kubernetes.io/is-default-class"
@@ -97,8 +98,8 @@ var _ = BeforeSuite(func() {
 	nodeStateController = informer.NewNodeController(env.Client, cluster)
 	nodeClaimStateController = informer.NewNodeClaimController(env.Client, cloudProvider, cluster)
 	podStateController = informer.NewPodController(env.Client, cluster)
-	prov = provisioning.NewProvisioner(env.Client, events.NewRecorder(&record.FakeRecorder{}), cloudProvider, cluster, fakeClock)
-	podController = provisioning.NewPodController(env.Client, prov, cluster)
+	prov = provisioningdynamic.NewController(env.Client, events.NewRecorder(&record.FakeRecorder{}), cloudProvider, cluster, fakeClock)
+	podController = provisioningdynamic.NewPodController(env.Client, prov, cluster)
 })
 
 var _ = AfterSuite(func() {

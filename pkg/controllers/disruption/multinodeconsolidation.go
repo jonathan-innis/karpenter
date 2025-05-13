@@ -96,7 +96,7 @@ func (m *MultiNodeConsolidation) ComputeCommand(ctx context.Context, disruptionB
 		return cmd, scheduling.Results{}, nil
 	}
 
-	if err := NewValidation(m.clock, m.cluster, m.kubeClient, m.provisioner, m.cloudProvider, m.recorder, m.queue, m.Reason()).IsValid(ctx, cmd, consolidationTTL); err != nil {
+	if err := NewValidation(m.clock, m.cluster, m.kubeClient, m.controller, m.cloudProvider, m.recorder, m.queue, m.Reason()).IsValid(ctx, cmd, consolidationTTL); err != nil {
 		if IsValidationError(err) {
 			log.FromContext(ctx).V(1).WithValues(cmd.LogValues()...).Info("abandoning multi-node consolidation attempt due to pod churn, command is no longer valid")
 			return Command{}, scheduling.Results{}, nil
