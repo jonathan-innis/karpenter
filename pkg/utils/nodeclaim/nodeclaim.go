@@ -87,7 +87,7 @@ func PodEventHandler(c client.Client, cloudProvider cloudprovider.CloudProvider)
 		if err := c.Get(ctx, types.NamespacedName{Name: nodeName}, node); err != nil {
 			return nil
 		}
-		ncs, err := ListManaged(ctx, c, cloudProvider, ForProviderID(node.Spec.ProviderID))
+		ncs, err := ListManaged(ctx, c, cloudProvider, ForProviderID(node.Spec.ProviderID), client.UnsafeDisableDeepCopy)
 		if err != nil {
 			return nil
 		}
@@ -101,7 +101,7 @@ func PodEventHandler(c client.Client, cloudProvider cloudprovider.CloudProvider)
 // and enqueues reconcile.Requests for the NodeClaims
 func NodeEventHandler(c client.Client, cloudProvider cloudprovider.CloudProvider) handler.EventHandler {
 	return handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, o client.Object) []reconcile.Request {
-		ncs, err := ListManaged(ctx, c, cloudProvider, ForProviderID(o.(*corev1.Node).Spec.ProviderID))
+		ncs, err := ListManaged(ctx, c, cloudProvider, ForProviderID(o.(*corev1.Node).Spec.ProviderID), client.UnsafeDisableDeepCopy)
 		if err != nil {
 			return nil
 		}
@@ -115,7 +115,7 @@ func NodeEventHandler(c client.Client, cloudProvider cloudprovider.CloudProvider
 // on the v1.NodePoolLabelKey and enqueues reconcile.Requests for the NodeClaim
 func NodePoolEventHandler(c client.Client, cloudProvider cloudprovider.CloudProvider) handler.EventHandler {
 	return handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, o client.Object) (requests []reconcile.Request) {
-		ncs, err := ListManaged(ctx, c, cloudProvider, ForNodePool(o.GetName()))
+		ncs, err := ListManaged(ctx, c, cloudProvider, ForNodePool(o.GetName()), client.UnsafeDisableDeepCopy)
 		if err != nil {
 			return nil
 		}
@@ -134,7 +134,7 @@ func NodeClassEventHandler(c client.Client) handler.EventHandler {
 			"spec.nodeClassRef.group": object.GVK(o).Group,
 			"spec.nodeClassRef.kind":  object.GVK(o).Kind,
 			"spec.nodeClassRef.name":  o.GetName(),
-		}); err != nil {
+		}, client.UnsafeDisableDeepCopy); err != nil {
 			return requests
 		}
 		return lo.Map(nodeClaimList.Items, func(n v1.NodeClaim, _ int) reconcile.Request {
