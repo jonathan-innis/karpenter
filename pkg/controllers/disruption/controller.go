@@ -216,6 +216,8 @@ func (c *Controller) executeCommand(ctx context.Context, m Method, cmd Command, 
 		return serrors.Wrap(fmt.Errorf("marking disrupted, %w", err), "command-id", commandID)
 	}
 
+	log.FromContext(ctx).Info("finished marking candidates as disrupted")
+
 	var nodeClaimNames []string
 	var err error
 	if len(cmd.replacements) > 0 {
@@ -274,8 +276,12 @@ func (c *Controller) MarkDisrupted(ctx context.Context, m Method, candidates ...
 		return serrors.Wrap(fmt.Errorf("tainting nodes, %w", err), "taint", pretty.Taint(v1.DisruptedNoScheduleTaint))
 	}
 
+	log.FromContext(ctx).Info("finished tainting all nodes")
+
 	providerIDs := lo.Map(candidates, func(c *Candidate, _ int) string { return c.ProviderID() })
 	c.cluster.MarkForDeletion(providerIDs...)
+
+	log.FromContext(ctx).Info("finished marking all nodes for deletion")
 
 	errs := make([]error, len(candidates))
 	workqueue.ParallelizeUntil(ctx, len(candidates), len(candidates), func(i int) {
@@ -289,7 +295,9 @@ func (c *Controller) MarkDisrupted(ctx context.Context, m Method, candidates ...
 		stored := nodeClaim.DeepCopy()
 		nodeClaim.StatusConditions().SetTrueWithReason(v1.ConditionTypeDisruptionReason, string(m.Reason()), string(m.Reason()))
 		errs[i] = client.IgnoreNotFound(c.kubeClient.Status().Patch(ctx, nodeClaim, client.MergeFrom(stored)))
+		log.FromContext(ctx).V(1).WithValues("nodeclaim", nodeClaim.Name).Info("updated disruption status")
 	})
+	log.FromContext(ctx).Info("finished updating disruption status on nodes")
 	return multierr.Combine(errs...)
 }
 

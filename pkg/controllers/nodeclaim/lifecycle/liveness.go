@@ -41,7 +41,7 @@ type Liveness struct {
 
 // registrationTTL is a heuristic time that we expect the node to register within
 // If we don't see the node within this time, then we should delete the NodeClaim and try again
-const registrationTTL = time.Minute * 15
+const registrationTTL = time.Hour
 
 func (l *Liveness) Reconcile(ctx context.Context, nodeClaim *v1.NodeClaim) (reconcile.Result, error) {
 	registered := nodeClaim.StatusConditions().Get(v1.ConditionTypeRegistered)
