@@ -56,13 +56,15 @@ type Cluster struct {
 	clock         clock.Clock
 	hasSynced     atomic.Bool
 
-	mu                        sync.RWMutex
-	nodes                     map[string]*StateNode           // provider id -> cached node
-	bindings                  map[types.NamespacedName]string // pod namespaced named -> node name
-	nodeNameToProviderID      map[string]string               // node name -> provider id
-	nodeClaimNameToProviderID map[string]string               // node claim name -> provider id
-	nodePoolResources         map[string]corev1.ResourceList  // node pool name -> resource list
-	daemonSetPods             sync.Map                        // daemonSet -> existing pod
+	mu                          sync.RWMutex
+	nodes                       map[string]*StateNode           // provider id -> cached node
+	bindings                    map[types.NamespacedName]string // pod namespaced named -> node name
+	nodeNameToProviderID        map[string]string               // node name -> provider id
+	nodeClaimNameToProviderID   map[string]string               // node claim name -> provider id
+	nodePoolResources           map[string]corev1.ResourceList  // node pool name -> resource list
+	nodeClaimNameToNodePoolName map[string]string               // nodeclaim name -> nodepool name
+	nodePoolNameToNodeClaims    map[string]sets.Set[string]     // node pool name -> node claim names
+	daemonSetPods               sync.Map                        // daemonSet -> existing pod
 
 	podAcks                         sync.Map // pod namespaced name -> time when Karpenter first saw the pod as pending
 	podsSchedulingAttempted         sync.Map // pod namespaced name -> time when Karpenter tried to schedule a pod
@@ -86,15 +88,17 @@ type Cluster struct {
 
 func NewCluster(clk clock.Clock, client client.Client, cloudProvider cloudprovider.CloudProvider) *Cluster {
 	return &Cluster{
-		clock:                     clk,
-		kubeClient:                client,
-		cloudProvider:             cloudProvider,
-		nodes:                     map[string]*StateNode{},
-		bindings:                  map[types.NamespacedName]string{},
-		daemonSetPods:             sync.Map{},
-		nodeNameToProviderID:      map[string]string{},
-		nodeClaimNameToProviderID: map[string]string{},
-		nodePoolResources:         map[string]corev1.ResourceList{},
+		clock:                       clk,
+		kubeClient:                  client,
+		cloudProvider:               cloudProvider,
+		nodes:                       map[string]*StateNode{},
+		bindings:                    map[types.NamespacedName]string{},
+		daemonSetPods:               sync.Map{},
+		nodeNameToProviderID:        map[string]string{},
+		nodeClaimNameToProviderID:   map[string]string{},
+		nodePoolResources:           map[string]corev1.ResourceList{},
+		nodeClaimNameToNodePoolName: map[string]string{},
+		nodePoolNameToNodeClaims:    map[string]sets.Set[string]{},
 
 		podAcks:                         sync.Map{},
 		podsSchedulableTimes:            sync.Map{},
@@ -320,6 +324,16 @@ func (c *Cluster) UpdateNodeClaim(nodeClaim *v1.NodeClaim) {
 	// If the nodeclaim hasn't launched yet, we want to add it into cluster state to ensure
 	// that we're not racing with the internal cache for the cluster, assuming the node doesn't exist.
 	c.nodeClaimNameToProviderID[nodeClaim.Name] = nodeClaim.Status.ProviderID
+	c.nodeClaimNameToNodePoolName[nodeClaim.Name] = nodeClaim.Labels[v1.NodePoolLabelKey]
+	if _, ok := c.nodePoolNameToNodeClaims[nodeClaim.Labels[v1.NodePoolLabelKey]]; !ok {
+		c.nodePoolNameToNodeClaims[nodeClaim.Labels[v1.NodePoolLabelKey]] = sets.New[string]()
+	}
+	// If our node is marked for deletion, we need to make sure that we delete it from node tracking
+	if nodeClaim.Status.ProviderID != "" && c.nodes[nodeClaim.Status.ProviderID].markedForDeletion {
+		c.nodePoolNameToNodeClaims[nodeClaim.Labels[v1.NodePoolLabelKey]].Delete(nodeClaim.Name)
+	} else {
+		c.nodePoolNameToNodeClaims[nodeClaim.Labels[v1.NodePoolLabelKey]].Insert(nodeClaim.Name)
+	}
 	ClusterStateNodesCount.Set(float64(len(c.nodes)), nil)
 }
 
@@ -328,6 +342,11 @@ func (c *Cluster) DeleteNodeClaim(name string) {
 	defer c.mu.Unlock()
 
 	c.cleanupNodeClaim(name)
+	nodePoolName := c.nodeClaimNameToNodePoolName[name]
+	delete(c.nodeClaimNameToNodePoolName, name)
+	if v, ok := c.nodePoolNameToNodeClaims[nodePoolName]; ok {
+		v.Delete(name)
+	}
 	ClusterStateNodesCount.Set(float64(len(c.nodes)), nil)
 }
 
@@ -554,6 +573,13 @@ func (c *Cluster) NodePoolResourcesFor(nodePoolName string) corev1.ResourceList 
 	defer c.mu.RUnlock()
 
 	return maps.Clone(c.nodePoolResources[nodePoolName])
+}
+
+func (c *Cluster) NodePoolNodesFor(nodePoolName string) int {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	return c.nodePoolNameToNodeClaims[nodePoolName].Len()
 }
 
 // Reset the cluster state for unit testing
