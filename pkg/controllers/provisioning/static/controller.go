@@ -33,8 +33,6 @@ import (
 
 	nodeutils "sigs.k8s.io/karpenter/pkg/utils/node"
 
-	"sigs.k8s.io/karpenter/pkg/utils/resources"
-
 	"sigs.k8s.io/karpenter/pkg/controllers/provisioning"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/events"
@@ -68,11 +66,7 @@ func NewController(kubeClient client.Client, cluster *state.Cluster, recorder ev
 // Reconcile the resource
 func (c *Controller) Reconcile(ctx context.Context, np *v1.NodePool) (reconcile.Result, error) {
 	ctx = injection.WithControllerName(ctx, "provisioning.static")
-	// TODO: This can be improved to not wait for cluster sync but we need to either rely on a manual
-	// update of NodePoolResources so that we track node count accurately, or handle getting NodeClaim count some other way
-	if !c.cluster.Synced(ctx) {
-		return reconcile.Result{RequeueAfter: time.Second}, nil
-	}
+
 	if !nodepoolutils.IsManaged(np, c.cloudProvider) {
 		return reconcile.Result{}, nil
 	}
@@ -82,14 +76,17 @@ func (c *Controller) Reconcile(ctx context.Context, np *v1.NodePool) (reconcile.
 	if np.Spec.Replicas == nil {
 		return reconcile.Result{}, nil
 	}
-	nodes := c.cluster.NodePoolResourcesFor(np.Name)[resources.Node]
-	if nodes.Value() > lo.FromPtr(np.Spec.Replicas) {
+	if !c.cluster.HasSynced() {
+		return reconcile.Result{RequeueAfter: time.Second}, nil
+	}
+	nodes := c.cluster.NodePoolNodesFor(np.Name)
+	if nodes >= int(lo.FromPtr(np.Spec.Replicas)) {
 		return reconcile.Result{}, nil
 	}
 	// Create the number of NodeClaims equal to the desired replica count
 	var nodeClaims []*scheduling.NodeClaim
 	nct := scheduling.NewNodeClaimTemplate(np)
-	for range lo.FromPtr(np.Spec.Replicas) - nodes.Value() {
+	for range int(lo.FromPtr(np.Spec.Replicas)) - nodes {
 		nodeClaims = append(nodeClaims, &scheduling.NodeClaim{NodeClaimTemplate: *nct})
 	}
 	if _, err := c.provisioner.CreateNodeClaims(ctx, nodeClaims, provisioning.WithReason(metrics.ProvisionedReason)); err != nil {
