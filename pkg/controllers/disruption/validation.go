@@ -20,7 +20,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"sync"
 	"time"
 
 	"github.com/samber/lo"
@@ -65,7 +64,6 @@ type validation struct {
 	kubeClient    client.Client
 	cloudProvider cloudprovider.CloudProvider
 	controller    *provisioningdynamic.Controller
-	once          sync.Once
 	recorder      events.Recorder
 	queue         *orchestration.Queue
 	reason        v1.DisruptionReason
