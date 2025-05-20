@@ -511,6 +511,7 @@ spec:
                   format: int64
                   type: integer
                 nodes:
+                  default: 0
                   description: Nodes is a count of nodes associated with this NodePool
                   format: int64
                   type: integer
@@ -523,8 +524,6 @@ spec:
                     x-kubernetes-int-or-string: true
                   description: Resources is the list of resources that have been provisioned.
                   type: object
-              required:
-                - nodes
               type: object
           required:
             - spec

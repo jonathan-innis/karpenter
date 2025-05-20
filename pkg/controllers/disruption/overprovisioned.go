@@ -24,8 +24,6 @@ import (
 	"github.com/samber/lo"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	"sigs.k8s.io/karpenter/pkg/utils/resources"
-
 	provisioningdynamic "sigs.k8s.io/karpenter/pkg/controllers/provisioning/dynamic"
 
 	"sigs.k8s.io/karpenter/pkg/utils/pretty"
@@ -58,8 +56,8 @@ func (o *Overprovisioned) ShouldDisrupt(_ context.Context, c *Candidate) bool {
 	if c.NodePool.Spec.Replicas == nil {
 		return false
 	}
-	nodeQuantity := o.cluster.NodePoolResourcesFor(c.NodePool.Name)[resources.Node]
-	return nodeQuantity.Value() > lo.FromPtr(c.NodePool.Spec.Replicas)
+	nodes := o.cluster.NodePoolNodesFor(c.NodePool.Name)
+	return nodes > int(lo.FromPtr(c.NodePool.Spec.Replicas))
 }
 
 // ComputeCommand generates a disruption command given candidates

@@ -24,7 +24,6 @@ import (
 	"github.com/patrickmn/go-cache"
 	"github.com/samber/lo"
 	"go.uber.org/multierr"
-	"golang.org/x/time/rate"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -88,13 +87,8 @@ func (c *Controller) Register(_ context.Context, m manager.Manager) error {
 			nodeclaimutils.NodeEventHandler(c.kubeClient, c.cloudProvider),
 		).
 		WithOptions(controller.Options{
-			RateLimiter: workqueue.NewTypedMaxOfRateLimiter[reconcile.Request](
-				// back off until last attempt occurs ~90 seconds before nodeclaim expiration
-				workqueue.NewTypedItemExponentialFailureRateLimiter[reconcile.Request](time.Second, time.Minute),
-				// 10 qps, 100 bucket size
-				&workqueue.TypedBucketRateLimiter[reconcile.Request]{Limiter: rate.NewLimiter(rate.Limit(10), 100)},
-			),
-			MaxConcurrentReconciles: 1000, // higher concurrency limit since we want fast reaction to node syncing and launch
+			RateLimiter:             workqueue.NewTypedItemExponentialFailureRateLimiter[reconcile.Request](time.Second, time.Second*10),
+			MaxConcurrentReconciles: 5000, // higher concurrency limit since we want fast reaction to node syncing and launch
 		}).
 		Complete(reconcile.AsReconciler(m.GetClient(), c))
 }

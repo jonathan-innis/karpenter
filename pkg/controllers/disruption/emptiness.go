@@ -24,8 +24,6 @@ import (
 	"github.com/samber/lo"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
-	"sigs.k8s.io/karpenter/pkg/utils/resources"
-
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	disruptionevents "sigs.k8s.io/karpenter/pkg/controllers/disruption/events"
 )
@@ -77,11 +75,11 @@ func (e *Emptiness) ComputeCommand(ctx context.Context, disruptionBudgetMapping 
 			continue
 		}
 		if candidate.NodePool.Spec.Replicas != nil {
-			nodeQuantity := e.cluster.NodePoolResourcesFor(candidate.NodePool.Name)[resources.Node]
+			nodeQuantity := e.cluster.NodePoolNodesFor(candidate.NodePool.Name)
 			// If total number of current nodes for a NodePool minus the Nodes we are about to disrupt
 			// is less than or equal to the desired count, we shouldn't disrupt the empty node since we should
 			// maintain this static capacity to match the desired replicas on the NodePool
-			if lo.FromPtr(candidate.NodePool.Spec.Replicas) >= nodeQuantity.Value()+int64(nodePoolDiffMapping[candidate.NodePool.Name]) {
+			if int(lo.FromPtr(candidate.NodePool.Spec.Replicas)) >= nodeQuantity+nodePoolDiffMapping[candidate.NodePool.Name] {
 				continue
 			}
 		}

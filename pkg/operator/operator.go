@@ -25,6 +25,7 @@ import (
 	"runtime"
 	"runtime/debug"
 	"sync"
+	"time"
 
 	"github.com/awslabs/operatorpkg/controller"
 	opmetrics "github.com/awslabs/operatorpkg/metrics"
@@ -149,6 +150,8 @@ func NewOperator() (context.Context, *Operator) {
 		LeaderElectionResourceLock:    resourcelock.LeasesResourceLock,
 		LeaderElectionReleaseOnCancel: true,
 		LeaderElectionConfig:          leaderConfig,
+		LeaseDuration:                 lo.ToPtr(time.Minute),
+		RenewDeadline:                 lo.ToPtr(time.Second * 50),
 		Metrics: server.Options{
 			BindAddress: fmt.Sprintf(":%d", options.FromContext(ctx).MetricsPort),
 		},
