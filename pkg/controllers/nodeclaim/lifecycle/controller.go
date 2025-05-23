@@ -88,7 +88,7 @@ func (c *Controller) Register(_ context.Context, m manager.Manager) error {
 			nodeclaimutils.NodeEventHandler(c.kubeClient, c.cloudProvider),
 		).
 		WithOptions(controller.Options{
-			RateLimiter:             workqueue.NewTypedItemExponentialFailureRateLimiter[reconcile.Request](time.Second, time.Second*10),
+			RateLimiter:             workqueue.NewTypedItemExponentialFailureRateLimiter[reconcile.Request](time.Second, time.Minute),
 			MaxConcurrentReconciles: 5000, // higher concurrency limit since we want fast reaction to node syncing and launch
 		}).
 		Complete(reconcile.AsReconciler(m.GetClient(), c))
