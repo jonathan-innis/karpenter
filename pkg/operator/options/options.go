@@ -26,7 +26,7 @@ import (
 
 	"github.com/samber/lo"
 	cliflag "k8s.io/component-base/cli/flag"
-
+	"k8s.io/klog/v2"
 	"sigs.k8s.io/karpenter/pkg/utils/env"
 )
 
@@ -113,6 +113,8 @@ func (o *Options) AddFlags(fs *FlagSet) {
 	fs.DurationVar(&o.BatchIdleDuration, "batch-idle-duration", env.WithDefaultDuration("BATCH_IDLE_DURATION", time.Second), "The maximum amount of time with no new pending pods that if exceeded ends the current batching window. If pods arrive faster than this time, the batching window will be extended up to the maxDuration. If they arrive slower, the pods will be batched separately.")
 	fs.StringVar(&o.preferencePolicyRaw, "preference-policy", env.WithDefaultString("PREFERENCE_POLICY", string(PreferencePolicyRespect)), "How the Karpenter scheduler should treat preferences. Preferences include preferredDuringSchedulingIgnoreDuringExecution node and pod affinities/anti-affinities and ScheduleAnyways topologySpreadConstraints. Can be one of 'Ignore' and 'Respect'")
 	fs.StringVar(&o.FeatureGates.inputStr, "feature-gates", env.WithDefaultString("FEATURE_GATES", "NodeRepair=false,ReservedCapacity=false,SpotToSpotConsolidation=false"), "Optional features can be enabled / disabled using feature gates. Current options are: NodeRepair, ReservedCapacity, and SpotToSpotConsolidation")
+
+	klog.InitFlags(fs.FlagSet)
 }
 
 func (o *Options) Parse(fs *FlagSet, args ...string) error {
