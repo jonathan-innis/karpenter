@@ -313,7 +313,6 @@ func (p *Provisioner) Schedule(ctx context.Context) (scheduler.Results, error) {
 	if len(pods) == 0 {
 		return scheduler.Results{}, nil
 	}
-	log.FromContext(ctx).V(1).WithValues("pending-pods", len(pendingPods), "deleting-pods", len(deletingNodePods)).Info("computing scheduling decision for provisionable pod(s)")
 
 	opts := []scheduler.Options{scheduler.DisableReservedCapacityFallback, scheduler.NumConcurrentReconciles(int(math.Ceil(float64(options.FromContext(ctx).CPURequests) / 1000.0)))}
 	if options.FromContext(ctx).PreferencePolicy == options.PreferencePolicyIgnore {
@@ -340,6 +339,7 @@ func (p *Provisioner) Schedule(ctx context.Context) (scheduler.Results, error) {
 	timeoutCtx, cancel := context.WithTimeout(ctx, time.Minute)
 	defer cancel()
 
+	log.FromContext(ctx).V(1).WithValues("pending-pods", len(pendingPods), "deleting-pods", len(deletingNodePods)).Info("computing scheduling decision for provisionable pod(s)")
 	results, err := s.Solve(timeoutCtx, pods)
 	// context errors are ignored because we want to finish provisioning for what has already been scheduled
 	if err != nil && !errors.Is(err, context.DeadlineExceeded) {
