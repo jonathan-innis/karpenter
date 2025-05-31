@@ -25,6 +25,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/client-go/util/workqueue"
 	"k8s.io/utils/clock"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -108,8 +109,10 @@ func (t *Terminator) Drain(ctx context.Context, node *corev1.Node, nodeGracePeri
 	podGroups := t.groupPodsByPriority(lo.Filter(pods, func(p *corev1.Pod, _ int) bool { return podutil.IsWaitingEviction(p, t.clock) }))
 	for _, group := range podGroups {
 		if len(group) > 0 {
-			// Only add pods to the eviction queue that haven't been evicted yet
-			t.evictionQueue.Add(node, lo.Filter(group, func(p *corev1.Pod, _ int) bool { return podutil.IsEvictable(p) })...)
+			ps := lo.Filter(group, func(p *corev1.Pod, _ int) bool { return podutil.IsEvictable(p) })
+			workqueue.ParallelizeUntil(ctx, len(ps), len(ps), func(i int) {
+				_ = t.evictionQueue.Evict(ctx, NewQueueKey(ps[i], node.Spec.ProviderID))
+			})
 			return NewNodeDrainError(fmt.Errorf("%d pods are waiting to be evicted", lo.SumBy(podGroups, func(pods []*corev1.Pod) int { return len(pods) })))
 		}
 	}
