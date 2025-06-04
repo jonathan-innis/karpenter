@@ -38,6 +38,13 @@ type Consolidation struct {
 func (c *Consolidation) Reconcile(ctx context.Context, nodePool *v1.NodePool, nodeClaim *v1.NodeClaim) (reconcile.Result, error) {
 	hasConsolidatableCondition := nodeClaim.StatusConditions().Get(v1.ConditionTypeConsolidatable) != nil
 
+	if nodePool.Spec.Replicas != nil {
+		if hasConsolidatableCondition {
+			_ = nodeClaim.StatusConditions().Clear(v1.ConditionTypeConsolidatable)
+			log.FromContext(ctx).V(1).Info("removing consolidatable status condition, nodepool is static")
+		}
+		return reconcile.Result{}, nil
+	}
 	// 1. If Consolidation isn't enabled, remove the consolidatable status condition
 	if nodePool.Spec.Disruption.ConsolidateAfter.Duration == nil {
 		if hasConsolidatableCondition {

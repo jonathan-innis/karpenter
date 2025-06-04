@@ -61,8 +61,8 @@ import (
 const (
 	queueBaseDelay          = 1 * time.Second
 	queueMaxDelay           = 10 * time.Second
-	maxRetryDuration        = 10 * time.Minute
-	maxConcurrentReconciles = 100
+	maxRetryDuration        = time.Hour
+	maxConcurrentReconciles = 1000
 )
 
 type UnrecoverableError struct {

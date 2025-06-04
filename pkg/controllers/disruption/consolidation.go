@@ -237,7 +237,6 @@ func (c *consolidation) computeConsolidation(ctx context.Context, candidates ...
 //     a. There are at least 15 cheapest instance type replacement options to consolidate.
 //     b. The current candidate is NOT part of the first 15 cheapest instance types inorder to avoid repeated consolidation.
 func (c *consolidation) computeSpotToSpotConsolidation(ctx context.Context, candidates []*Candidate, results pscheduling.Results, candidatePrice float64) (Command, error) {
-
 	// Spot consolidation is turned off.
 	if !options.FromContext(ctx).FeatureGates.SpotToSpotConsolidation {
 		if len(candidates) == 1 {

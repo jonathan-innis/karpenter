@@ -47,9 +47,9 @@ func NewMultiNodeConsolidation(c consolidation) *MultiNodeConsolidation {
 	}
 }
 
-func (m *MultiNodeConsolidation) ComputeCommand(ctx context.Context, disruptionBudgetMapping map[string]int, candidates ...*Candidate) (Command, error) {
+func (m *MultiNodeConsolidation) ComputeCommands(ctx context.Context, disruptionBudgetMapping map[string]int, candidates ...*Candidate) ([]Command, error) {
 	if m.IsConsolidated() {
-		return Command{}, nil
+		return nil, nil
 	}
 	candidates = m.sortCandidates(candidates)
 
@@ -86,7 +86,7 @@ func (m *MultiNodeConsolidation) ComputeCommand(ctx context.Context, disruptionB
 
 	cmd, err := m.firstNConsolidationOption(ctx, disruptableCandidates, maxParallel)
 	if err != nil {
-		return Command{}, err
+		return nil, err
 	}
 
 	if cmd.Decision() == NoOpDecision {
@@ -96,17 +96,17 @@ func (m *MultiNodeConsolidation) ComputeCommand(ctx context.Context, disruptionB
 		if !constrainedByBudgets {
 			m.markConsolidated()
 		}
-		return cmd, nil
+		return []Command{cmd}, nil
 	}
 
 	if cmd, err = m.Validate(ctx, cmd, consolidationTTL); err != nil {
 		if IsValidationError(err) {
 			log.FromContext(ctx).V(1).WithValues(cmd.LogValues()...).Info("abandoning multi-node consolidation attempt due to pod churn, command is no longer valid")
-			return Command{}, nil
+			return nil, nil
 		}
-		return Command{}, fmt.Errorf("validating consolidation, %w", err)
+		return nil, fmt.Errorf("validating consolidation, %w", err)
 	}
-	return cmd, nil
+	return []Command{cmd}, nil
 }
 
 // firstNConsolidationOption looks at the first N NodeClaims to determine if they can all be consolidated at once.  The

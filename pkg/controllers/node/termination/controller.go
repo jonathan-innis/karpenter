@@ -395,7 +395,7 @@ func (c *Controller) Register(_ context.Context, m manager.Manager) error {
 					// 10 qps, 100 bucket size
 					&workqueue.TypedBucketRateLimiter[reconcile.Request]{Limiter: rate.NewLimiter(rate.Limit(10), 100)},
 				),
-				MaxConcurrentReconciles: 100,
+				MaxConcurrentReconciles: 5000,
 			},
 		).
 		Complete(reconcile.AsReconciler(m.GetClient(), c))
