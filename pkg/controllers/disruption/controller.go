@@ -29,7 +29,9 @@ import (
 	"github.com/awslabs/operatorpkg/singleton"
 	"github.com/google/uuid"
 	"github.com/samber/lo"
+	"go.uber.org/multierr"
 	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/client-go/util/workqueue"
 	"k8s.io/utils/clock"
 	controllerruntime "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -183,22 +185,27 @@ func (c *Controller) disrupt(ctx context.Context, disruption Method) (bool, erro
 		return false, fmt.Errorf("building disruption budgets, %w", err)
 	}
 	// Determine the disruption action
-	cmd, err := disruption.ComputeCommand(ctx, disruptionBudgetMapping, candidates...)
+	cmds, err := disruption.ComputeCommands(ctx, disruptionBudgetMapping, candidates...)
 	if err != nil {
 		return false, fmt.Errorf("computing disruption decision, %w", err)
 	}
-	if cmd.Decision() == NoOpDecision {
+	cmds = lo.Filter(cmds, func(c Command, _ int) bool { return c.Decision() != NoOpDecision })
+	if len(cmds) == 0 {
 		return false, nil
 	}
-	// Assign common fields to the command after creation
-	cmd.CreationTimestamp = c.clock.Now()
-	cmd.ID = uuid.New()
-	cmd.Method = disruption
-	// Attempt to disrupt
-	if err = c.queue.StartCommand(ctx, &cmd); err != nil {
-		return false, fmt.Errorf("disrupting candidates, %w", err)
-	}
-	return true, nil
+
+	errs := make([]error, len(cmds))
+	workqueue.ParallelizeUntil(ctx, len(cmds), len(cmds), func(i int) {
+		// Assign common fields to the command after creation
+		cmds[i].CreationTimestamp = c.clock.Now()
+		cmds[i].ID = uuid.New()
+		cmds[i].Method = disruption
+		// Attempt to disrupt
+		if err = c.queue.StartCommand(ctx, &cmds[i]); err != nil {
+			errs[i] = fmt.Errorf("disrupting candidates, %w", err)
+		}
+	})
+	return true, fmt.Errorf("disrupting candidates, %w", multierr.Combine(errs...))
 }
 
 func (c *Controller) recordRun(s string) {

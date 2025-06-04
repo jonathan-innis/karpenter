@@ -49,7 +49,7 @@ const (
 
 type Method interface {
 	ShouldDisrupt(context.Context, *Candidate) bool
-	ComputeCommand(context.Context, map[string]int, ...*Candidate) (Command, error)
+	ComputeCommands(context.Context, map[string]int, ...*Candidate) ([]Command, error)
 	Reason() v1.DisruptionReason
 	Class() string
 	ConsolidationType() string
