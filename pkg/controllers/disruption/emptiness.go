@@ -56,9 +56,9 @@ func (e *Emptiness) ShouldDisrupt(_ context.Context, c *Candidate) bool {
 // ComputeCommand generates a disruption command given candidates
 //
 //nolint:gocyclo
-func (e *Emptiness) ComputeCommand(ctx context.Context, disruptionBudgetMapping map[string]int, candidates ...*Candidate) (Command, error) {
+func (e *Emptiness) ComputeCommands(ctx context.Context, disruptionBudgetMapping map[string]int, candidates ...*Candidate) ([]Command, error) {
 	if e.IsConsolidated() {
-		return Command{}, nil
+		return nil, nil
 	}
 	candidates = e.sortCandidates(candidates)
 
@@ -97,7 +97,7 @@ func (e *Emptiness) ComputeCommand(ctx context.Context, disruptionBudgetMapping 
 		if !constrainedByBudgets {
 			e.markConsolidated()
 		}
-		return Command{}, nil
+		return nil, nil
 	}
 
 	cmd := Command{
@@ -109,7 +109,7 @@ func (e *Emptiness) ComputeCommand(ctx context.Context, disruptionBudgetMapping 
 	// cluster.IsNodeNominated already).
 	select {
 	case <-ctx.Done():
-		return Command{}, errors.New("interrupted")
+		return nil, errors.New("interrupted")
 	case <-e.clock.After(consolidationTTL):
 	}
 
@@ -117,12 +117,12 @@ func (e *Emptiness) ComputeCommand(ctx context.Context, disruptionBudgetMapping 
 	if err != nil {
 		if IsValidationError(err) {
 			log.FromContext(ctx).V(1).WithValues(cmd.LogValues()...).Info("abandoning empty node consolidation attempt due to pod churn, command is no longer valid")
-			return Command{}, nil
+			return nil, nil
 		}
-		return Command{}, err
+		return nil, err
 	}
 
-	return validCmd, nil
+	return []Command{validCmd}, nil
 }
 
 func (e *Emptiness) Reason() v1.DisruptionReason {

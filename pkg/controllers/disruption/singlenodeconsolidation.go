@@ -51,9 +51,9 @@ func NewSingleNodeConsolidation(c consolidation) *SingleNodeConsolidation {
 
 // ComputeCommand generates a disruption command given candidates
 // nolint:gocyclo
-func (s *SingleNodeConsolidation) ComputeCommand(ctx context.Context, disruptionBudgetMapping map[string]int, candidates ...*Candidate) (Command, error) {
+func (s *SingleNodeConsolidation) ComputeCommands(ctx context.Context, disruptionBudgetMapping map[string]int, candidates ...*Candidate) ([]Command, error) {
 	if s.IsConsolidated() {
-		return Command{}, nil
+		return nil, nil
 	}
 	candidates = s.SortCandidates(ctx, candidates)
 
@@ -70,7 +70,7 @@ func (s *SingleNodeConsolidation) ComputeCommand(ctx context.Context, disruption
 
 			s.PreviouslyUnseenNodePools = unseenNodePools
 
-			return Command{}, nil
+			return nil, nil
 		}
 		// Track that we've seen this nodepool
 		unseenNodePools.Delete(candidate.NodePool.Name)
@@ -101,11 +101,11 @@ func (s *SingleNodeConsolidation) ComputeCommand(ctx context.Context, disruption
 		if _, err = s.Validate(ctx, cmd, consolidationTTL); err != nil {
 			if IsValidationError(err) {
 				log.FromContext(ctx).V(1).WithValues(cmd.LogValues()...).Info("abandoning single-node consolidation attempt due to pod churn, command is no longer valid")
-				return Command{}, nil
+				return nil, nil
 			}
-			return Command{}, fmt.Errorf("validating consolidation, %w", err)
+			return nil, fmt.Errorf("validating consolidation, %w", err)
 		}
-		return cmd, nil
+		return []Command{cmd}, nil
 	}
 
 	if !constrainedByBudgets {
@@ -117,7 +117,7 @@ func (s *SingleNodeConsolidation) ComputeCommand(ctx context.Context, disruption
 
 	s.PreviouslyUnseenNodePools = unseenNodePools
 
-	return Command{}, nil
+	return nil, nil
 }
 
 func (s *SingleNodeConsolidation) Reason() v1.DisruptionReason {

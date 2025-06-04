@@ -20,8 +20,13 @@ import (
 	"context"
 	"errors"
 	"sort"
+	"time"
 
+	"github.com/samber/lo"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/log"
+
+	"sigs.k8s.io/karpenter/pkg/controllers/provisioning/scheduling"
 
 	provisioningdynamic "sigs.k8s.io/karpenter/pkg/controllers/provisioning/dynamic"
 
@@ -55,19 +60,29 @@ func (d *Drift) ShouldDisrupt(_ context.Context, c *Candidate) bool {
 	return c.NodeClaim.StatusConditions().Get(string(d.Reason())).IsTrue()
 }
 
-// ComputeCommand generates a disruption command given candidates
-func (d *Drift) ComputeCommand(ctx context.Context, disruptionBudgetMapping map[string]int, candidates ...*Candidate) (Command, error) {
+// ComputeCommands generates disruption commands given candidates
+//
+//nolint:gocyclo
+func (d *Drift) ComputeCommands(ctx context.Context, disruptionBudgetMapping map[string]int, candidates ...*Candidate) ([]Command, error) {
 	sort.Slice(candidates, func(i int, j int) bool {
 		return candidates[i].NodeClaim.StatusConditions().Get(string(d.Reason())).LastTransitionTime.Time.Before(
 			candidates[j].NodeClaim.StatusConditions().Get(string(d.Reason())).LastTransitionTime.Time)
 	})
 
+	timeoutCtx, cancel := context.WithTimeout(ctx, time.Minute)
+	defer cancel()
+
+	var cmds []Command
 	for _, candidate := range candidates {
+		log.FromContext(ctx).WithValues("candidate", candidate.NodeClaim.Name).Info("considering candidate for drift")
+		if timeoutCtx.Err() != nil {
+			break
+		}
 		// Filter out empty candidates. If there was an empty node that wasn't consolidated before this, we should
 		// assume that it was due to budgets. If we don't filter out budgets, users who set a budget for `empty`
 		// can find their nodes disrupted here, which while that in itself isn't an issue for empty nodes, it could
 		// constrain the `drift` budget.
-		if len(candidate.reschedulablePods) == 0 {
+		if len(candidate.reschedulablePods) == 0 && candidate.NodePool.Spec.Replicas == nil {
 			continue
 		}
 		// If the disruption budget doesn't allow this candidate to be disrupted,
@@ -76,28 +91,40 @@ func (d *Drift) ComputeCommand(ctx context.Context, disruptionBudgetMapping map[
 		if disruptionBudgetMapping[candidate.NodePool.Name] == 0 {
 			continue
 		}
-		// Check if we need to create any NodeClaims.
-		results, err := SimulateScheduling(ctx, d.kubeClient, d.cluster, d.controller, candidate)
-		if err != nil {
-			// if a candidate is now deleting, just retry
-			if errors.Is(err, errCandidateDeleting) {
-				continue
+
+		var results scheduling.Results
+		var err error
+		if candidate.NodePool.Spec.Replicas != nil && d.cluster.NodePoolNodesFor(candidate.NodePool.Name) <= int(lo.FromPtr(candidate.NodePool.Spec.Replicas)) {
+			results = scheduling.Results{
+				NewNodeClaims: []*scheduling.NodeClaim{{NodeClaimTemplate: *scheduling.NewNodeClaimTemplate(candidate.NodePool), Pods: candidate.reschedulablePods}},
 			}
-			return Command{}, err
+		} else {
+			// Check if we need to create any NodeClaims.
+			results, err = SimulateScheduling(timeoutCtx, d.kubeClient, d.cluster, d.controller, candidate)
+			if err != nil {
+				// if a candidate is now deleting, just retry
+				if errors.Is(err, errCandidateDeleting) {
+					continue
+				}
+				if errors.Is(err, context.DeadlineExceeded) {
+					continue
+				}
+				return nil, err
+			}
 		}
+
 		// Emit an event that we couldn't reschedule the pods on the node.
 		if !results.AllNonPendingPodsScheduled() {
 			d.recorder.Publish(disruptionevents.Blocked(candidate.Node, candidate.NodeClaim, pretty.Sentence(results.NonPendingPodSchedulingErrors()))...)
 			continue
 		}
-
-		return Command{
+		cmds = append(cmds, Command{
 			Candidates:   []*Candidate{candidate},
 			Replacements: replacementsFromNodeClaims(results.NewNodeClaims...),
 			Results:      results,
-		}, nil
+		})
 	}
-	return Command{}, nil
+	return cmds, nil
 }
 
 func (d *Drift) Reason() v1.DisruptionReason {
