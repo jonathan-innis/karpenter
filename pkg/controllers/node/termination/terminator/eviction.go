@@ -101,7 +101,7 @@ func (q *Queue) Register(_ context.Context, m manager.Manager) error {
 		})).
 		WithOptions(controller.Options{
 			RateLimiter:             reasonable.RateLimiter(),
-			MaxConcurrentReconciles: 100,
+			MaxConcurrentReconciles: 5000,
 		}).
 		Complete(reconcile.AsReconciler(m.GetClient(), q))
 }

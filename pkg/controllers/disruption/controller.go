@@ -46,7 +46,6 @@ import (
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/controllers/disruption/orchestration"
 	"sigs.k8s.io/karpenter/pkg/controllers/provisioning"
-	"sigs.k8s.io/karpenter/pkg/controllers/provisioning/scheduling"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/events"
 	"sigs.k8s.io/karpenter/pkg/metrics"
@@ -190,26 +189,28 @@ func (c *Controller) disrupt(ctx context.Context, disruption Method) (bool, erro
 		return false, fmt.Errorf("building disruption budgets, %w", err)
 	}
 	// Determine the disruption action
-	cmd, schedulingResults, err := disruption.ComputeCommand(ctx, disruptionBudgetMapping, candidates...)
+	cmds, err := disruption.ComputeCommands(ctx, disruptionBudgetMapping, candidates...)
 	if err != nil {
 		return false, fmt.Errorf("computing disruption decision, %w", err)
 	}
-	if cmd.Decision() == NoOpDecision {
+	cmds = lo.Filter(cmds, func(c Command, _ int) bool { return c.Decision() != NoOpDecision })
+	if len(cmds) == 0 {
 		return false, nil
 	}
 
-	// Attempt to disrupt
-	if err := c.executeCommand(ctx, disruption, cmd, schedulingResults); err != nil {
-		return false, fmt.Errorf("disrupting candidates, %w", err)
-	}
-	return true, nil
+	errs := make([]error, len(cmds))
+	workqueue.ParallelizeUntil(ctx, len(cmds), len(cmds), func(i int) {
+		// Attempt to disrupt
+		errs[i] = c.executeCommand(ctx, disruption, cmds[i])
+	})
+	return true, fmt.Errorf("disrupting candidates, %w", multierr.Combine(errs...))
 }
 
 // executeCommand will do the following, untainting if the step fails.
 // 1. Taint candidate nodes
 // 2. Spin up replacement nodes
 // 3. Add Command to orchestration.Queue to wait to delete the candiates.
-func (c *Controller) executeCommand(ctx context.Context, m Method, cmd Command, schedulingResults scheduling.Results) error {
+func (c *Controller) executeCommand(ctx context.Context, m Method, cmd Command) error {
 	commandID := uuid.NewUUID()
 	log.FromContext(ctx).WithValues(append([]any{"command-id", string(commandID), "reason", strings.ToLower(string(m.Reason()))}, cmd.LogValues()...)...).Info("disrupting node(s)")
 
@@ -239,7 +240,7 @@ func (c *Controller) executeCommand(ctx context.Context, m Method, cmd Command, 
 	// tainted with the Karpenter taint, the provisioning controller will continue
 	// to do scheduling simulations and nominate the pods on the candidate nodes until
 	// the node is cleaned up.
-	schedulingResults.Record(log.IntoContext(ctx, operatorlogging.NopLogger), c.recorder, c.cluster)
+	cmd.results.Record(log.IntoContext(ctx, operatorlogging.NopLogger), c.recorder, c.cluster)
 
 	stateNodes := lo.Map(markedCandidates, func(c *Candidate, _ int) *state.StateNode { return c.StateNode })
 	if err = c.queue.Add(orchestration.NewCommand(nodeClaimNames, stateNodes, commandID, m.Reason(), m.ConsolidationType())); err != nil {
