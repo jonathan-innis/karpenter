@@ -51,7 +51,7 @@ import (
 const (
 	queueBaseDelay   = 1 * time.Second
 	queueMaxDelay    = 10 * time.Second
-	maxRetryDuration = 10 * time.Minute
+	maxRetryDuration = time.Hour
 )
 
 type Command struct {

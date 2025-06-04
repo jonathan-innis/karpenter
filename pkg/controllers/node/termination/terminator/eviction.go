@@ -123,7 +123,7 @@ func (q *Queue) Register(_ context.Context, m manager.Manager) error {
 				workqueue.NewTypedItemExponentialFailureRateLimiter[reconcile.Request](evictionQueueBaseDelay, evictionQueueMaxDelay),
 				&workqueue.TypedBucketRateLimiter[reconcile.Request]{Limiter: rate.NewLimiter(rate.Limit(100), 1000)},
 			),
-			MaxConcurrentReconciles: 100,
+			MaxConcurrentReconciles: 5000,
 		}).
 		Complete(reconcile.AsReconciler(m.GetClient(), q))
 }

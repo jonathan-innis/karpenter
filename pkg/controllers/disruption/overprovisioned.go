@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"sort"
+	"time"
 
 	"github.com/samber/lo"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -30,7 +31,6 @@ import (
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	disruptionevents "sigs.k8s.io/karpenter/pkg/controllers/disruption/events"
-	"sigs.k8s.io/karpenter/pkg/controllers/provisioning/scheduling"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/events"
 )
@@ -57,17 +57,23 @@ func (o *Overprovisioned) ShouldDisrupt(_ context.Context, c *Candidate) bool {
 	if c.NodePool.Spec.Replicas == nil {
 		return false
 	}
-	nodes := o.cluster.NodePoolNodesFor(c.NodePool.Name)
-	return nodes > int(lo.FromPtr(c.NodePool.Spec.Replicas))
+	return o.cluster.NodePoolNodesFor(c.NodePool.Name) > int(lo.FromPtr(c.NodePool.Spec.Replicas))
 }
 
 // ComputeCommand generates a disruption command given candidates
-func (o *Overprovisioned) ComputeCommand(ctx context.Context, disruptionBudgetMapping map[string]int, candidates ...*Candidate) (Command, scheduling.Results, error) {
+func (o *Overprovisioned) ComputeCommands(ctx context.Context, disruptionBudgetMapping map[string]int, candidates ...*Candidate) ([]Command, error) {
 	sort.Slice(candidates, func(i int, j int) bool {
 		return candidates[i].NodeClaim.CreationTimestamp.Before(&candidates[j].NodeClaim.CreationTimestamp)
 	})
 
+	timeoutCtx, cancel := context.WithTimeout(ctx, time.Minute)
+	defer cancel()
+
+	var cmds []Command
 	for _, candidate := range candidates {
+		if timeoutCtx.Err() != nil {
+			break
+		}
 		// Filter out empty candidates. If there was an empty node that wasn't consolidated before this, we should
 		// assume that it was due to budgets. If we don't filter out budgets, users who set a budget for `empty`
 		// can find their nodes disrupted here, which while that in itself isn't an issue for empty nodes, it could
@@ -82,25 +88,28 @@ func (o *Overprovisioned) ComputeCommand(ctx context.Context, disruptionBudgetMa
 			continue
 		}
 		// Check if we need to create any NodeClaims.
-		results, err := SimulateScheduling(ctx, o.kubeClient, o.cluster, o.controller, candidate)
+		results, err := SimulateScheduling(timeoutCtx, o.kubeClient, o.cluster, o.controller, candidate)
 		if err != nil {
 			// if a candidate is now deleting, just retry
 			if errors.Is(err, errCandidateDeleting) {
 				continue
 			}
-			return Command{}, scheduling.Results{}, err
+			if errors.Is(err, context.DeadlineExceeded) {
+				continue
+			}
+			return nil, err
 		}
 		// Emit an event that we couldn't reschedule the pods on the node.
 		if !results.AllNonPendingPodsScheduled() {
 			o.recorder.Publish(disruptionevents.Blocked(candidate.Node, candidate.NodeClaim, pretty.Sentence(results.NonPendingPodSchedulingErrors()))...)
 			continue
 		}
-		return Command{
+		cmds = append(cmds, Command{
 			candidates:   []*Candidate{candidate},
 			replacements: results.NewNodeClaims,
-		}, results, nil
+		})
 	}
-	return Command{}, scheduling.Results{}, nil
+	return cmds, nil
 }
 
 func (o *Overprovisioned) Reason() v1.DisruptionReason {

@@ -219,7 +219,7 @@ var _ = Describe("Provisioning", func() {
 		ExpectApplied(ctx, env.Client, test.NodePool())
 		pod := test.UnschedulablePod()
 		cluster.AckPods(pod)
-		ExpectProvisioned(ctx, env.Client, cluster, cloudProvider, prov, pod)
+		ExpectProvisioned(ctx, env.Client, cluster, cloudProvider, controller, pod)
 		nodes := &corev1.NodeList{}
 		Expect(env.Client.List(ctx, nodes)).To(Succeed())
 		Expect(len(nodes.Items)).To(Equal(1))
@@ -230,7 +230,7 @@ var _ = Describe("Provisioning", func() {
 		ExpectApplied(ctx, env.Client, test.NodePool())
 		pods := test.UnschedulablePods(test.PodOptions{}, 100)
 		cluster.AckPods(pods...)
-		ExpectProvisioned(ctx, env.Client, cluster, cloudProvider, prov, pods...)
+		ExpectProvisioned(ctx, env.Client, cluster, cloudProvider, controller, pods...)
 		nodes := &corev1.NodeList{}
 		Expect(env.Client.List(ctx, nodes)).To(Succeed())
 		Expect(len(nodes.Items)).ToNot(Equal(0))

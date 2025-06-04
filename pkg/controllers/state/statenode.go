@@ -33,8 +33,6 @@ import (
 	"k8s.io/client-go/util/workqueue"
 	"k8s.io/klog/v2"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/log"
-
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/operator/options"
 	"sigs.k8s.io/karpenter/pkg/scheduling"
@@ -526,7 +524,6 @@ func RequireNoScheduleTaint(ctx context.Context, kubeClient client.Client, addTa
 				return
 			}
 		}
-		log.FromContext(ctx).WithValues("node", nodes[i].Node.Name).V(1).Info("tainted node")
 	})
 	return multierr.Combine(errs...)
 }
