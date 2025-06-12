@@ -193,7 +193,6 @@ func (c *Controller) disrupt(ctx context.Context, disruption Method) (bool, erro
 	if len(cmds) == 0 {
 		return false, nil
 	}
-
 	errs := make([]error, len(cmds))
 	workqueue.ParallelizeUntil(ctx, len(cmds), len(cmds), func(i int) {
 		// Assign common fields to the command after creation
@@ -205,7 +204,10 @@ func (c *Controller) disrupt(ctx context.Context, disruption Method) (bool, erro
 			errs[i] = fmt.Errorf("disrupting candidates, %w", err)
 		}
 	})
-	return true, fmt.Errorf("disrupting candidates, %w", multierr.Combine(errs...))
+	if err = multierr.Combine(errs...); err != nil {
+		return false, fmt.Errorf("disrupting candidates, %w", err)
+	}
+	return true, nil
 }
 
 func (c *Controller) recordRun(s string) {

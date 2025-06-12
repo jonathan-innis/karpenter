@@ -81,7 +81,7 @@ func (c *Controller) Reconcile(ctx context.Context, np *v1.NodePool) (reconcile.
 	}
 	nodes := c.cluster.NodePoolNodesFor(np.Name)
 	if nodes >= int(lo.FromPtr(np.Spec.Replicas)) {
-		return reconcile.Result{}, nil
+		return reconcile.Result{RequeueAfter: time.Minute}, nil
 	}
 	// Create the number of NodeClaims equal to the desired replica count
 	var nodeClaims []*scheduling.NodeClaim
@@ -92,7 +92,7 @@ func (c *Controller) Reconcile(ctx context.Context, np *v1.NodePool) (reconcile.
 	if _, err := c.provisioner.CreateNodeClaims(ctx, nodeClaims, provisioning.WithReason(metrics.ProvisionedReason)); err != nil {
 		return reconcile.Result{}, fmt.Errorf("creating nodeclaims, %w", err)
 	}
-	return reconcile.Result{}, nil
+	return reconcile.Result{RequeueAfter: time.Minute}, nil
 }
 
 func (c *Controller) Register(_ context.Context, m manager.Manager) error {

@@ -60,7 +60,7 @@ func (d *Drift) ShouldDisrupt(_ context.Context, c *Candidate) bool {
 	return c.NodeClaim.StatusConditions().Get(string(d.Reason())).IsTrue()
 }
 
-// ComputeCommands generates disruption commands given candidates
+// ComputeCommands generates a disruption command given candidates
 //
 //nolint:gocyclo
 func (d *Drift) ComputeCommands(ctx context.Context, disruptionBudgetMapping map[string]int, candidates ...*Candidate) ([]Command, error) {
