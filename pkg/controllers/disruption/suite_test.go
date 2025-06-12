@@ -31,6 +31,8 @@ import (
 	provisioningdynamic "sigs.k8s.io/karpenter/pkg/controllers/provisioning/dynamic"
 	pscheduling "sigs.k8s.io/karpenter/pkg/controllers/provisioning/scheduling"
 
+	pscheduling "sigs.k8s.io/karpenter/pkg/controllers/provisioning/scheduling"
+
 	"sigs.k8s.io/karpenter/pkg/events"
 	"sigs.k8s.io/karpenter/pkg/metrics"
 
@@ -2270,7 +2272,6 @@ func ExpectMakeNewNodeClaimsReady(ctx context.Context, c client.Client, wg *sync
 }
 
 func NewTestingQueue(kubeClient client.Client, recorder events.Recorder, cluster *state.Cluster, clock clockiface.Clock) *disruption.Queue {
-
 	q := disruption.NewQueue(kubeClient, recorder, cluster, clock)
 	q.TypedRateLimitingInterface = test.NewTypedRateLimitingInterface[*disruption.Command](workqueue.TypedQueueConfig[*disruption.Command]{Name: "disruption.workqueue"})
 	return q
