@@ -25,6 +25,8 @@ import (
 	"github.com/samber/lo"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
+	"sigs.k8s.io/karpenter/pkg/controllers/provisioning/scheduling"
+
 	provisioningdynamic "sigs.k8s.io/karpenter/pkg/controllers/provisioning/dynamic"
 
 	"sigs.k8s.io/karpenter/pkg/utils/pretty"
@@ -105,8 +107,8 @@ func (o *Overprovisioned) ComputeCommands(ctx context.Context, disruptionBudgetM
 			continue
 		}
 		cmds = append(cmds, Command{
-			candidates:   []*Candidate{candidate},
-			replacements: results.NewNodeClaims,
+			Candidates:   []*Candidate{candidate},
+			Replacements: lo.Map(results.NewNodeClaims, func(n *scheduling.NodeClaim, _ int) *Replacement { return &Replacement{NodeClaim: n} }),
 		})
 	}
 	return cmds, nil

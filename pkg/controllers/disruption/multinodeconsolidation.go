@@ -29,7 +29,6 @@ import (
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
-	"sigs.k8s.io/karpenter/pkg/controllers/provisioning/scheduling"
 	scheduler "sigs.k8s.io/karpenter/pkg/scheduling"
 )
 
@@ -137,7 +136,7 @@ func (m *MultiNodeConsolidation) firstNConsolidationOption(ctx context.Context, 
 		if err != nil {
 			if errors.Is(err, context.DeadlineExceeded) {
 				ConsolidationTimeoutsTotal.Inc(map[string]string{ConsolidationTypeLabel: m.ConsolidationType()})
-				if lastSavedCommand.candidates == nil {
+				if lastSavedCommand.Candidates == nil {
 					log.FromContext(ctx).V(1).Info(fmt.Sprintf("failed to find a multi-node consolidation after timeout, last considered batch had %d", (min+max)/2))
 					return Command{}, nil
 				}
@@ -152,8 +151,8 @@ func (m *MultiNodeConsolidation) firstNConsolidationOption(ctx context.Context, 
 		// required
 		replacementHasValidInstanceTypes := false
 		if cmd.Decision() == ReplaceDecision {
-			cmd.replacements[0].InstanceTypeOptions, err = filterOutSameType(cmd.replacements[0], candidatesToConsolidate)
-			replacementHasValidInstanceTypes = len(cmd.replacements[0].InstanceTypeOptions) > 0 && err == nil
+			cmd.Replacements[0].InstanceTypeOptions, err = filterOutSameType(cmd.Replacements[0], candidatesToConsolidate)
+			replacementHasValidInstanceTypes = len(cmd.Replacements[0].InstanceTypeOptions) > 0 && err == nil
 		}
 
 		// replacementHasValidInstanceTypes will be false if the replacement action has valid instance types remaining after filtering.
@@ -184,7 +183,7 @@ func (m *MultiNodeConsolidation) firstNConsolidationOption(ctx context.Context, 
 // This code sees that t3a.small is the cheapest type in both lists and filters it and anything more expensive out
 // leaving the valid consolidation:
 // NodeClaims=[t3a.2xlarge, t3a.2xlarge, t3a.small] -> 1 of t3a.nano
-func filterOutSameType(newNodeClaim *scheduling.NodeClaim, consolidate []*Candidate) ([]*cloudprovider.InstanceType, error) {
+func filterOutSameType(newNodeClaim *Replacement, consolidate []*Candidate) ([]*cloudprovider.InstanceType, error) {
 	existingInstanceTypes := sets.New[string]()
 	pricesByInstanceType := map[string]float64{}
 
@@ -216,7 +215,8 @@ func filterOutSameType(newNodeClaim *scheduling.NodeClaim, consolidate []*Candid
 		}
 	}
 	// swallow the error since we don't allow min values to impact reschedulability in multi node claim
-	newNodeClaim, err := newNodeClaim.RemoveInstanceTypeOptionsByPriceAndMinValues(newNodeClaim.Requirements, maxPrice)
+	var err error
+	newNodeClaim.NodeClaim, err = newNodeClaim.NodeClaim.RemoveInstanceTypeOptionsByPriceAndMinValues(newNodeClaim.Requirements, maxPrice)
 	if err != nil {
 		return nil, err
 	}

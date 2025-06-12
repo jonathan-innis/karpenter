@@ -29,13 +29,12 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
+	"sigs.k8s.io/karpenter/pkg/cloudprovider"
+	"sigs.k8s.io/karpenter/pkg/controllers/disruption"
 	metricsnode "sigs.k8s.io/karpenter/pkg/controllers/metrics/node"
 	metricsnodepool "sigs.k8s.io/karpenter/pkg/controllers/metrics/nodepool"
 	metricspod "sigs.k8s.io/karpenter/pkg/controllers/metrics/pod"
 
-	"sigs.k8s.io/karpenter/pkg/cloudprovider"
-	"sigs.k8s.io/karpenter/pkg/controllers/disruption"
-	"sigs.k8s.io/karpenter/pkg/controllers/disruption/orchestration"
 	"sigs.k8s.io/karpenter/pkg/controllers/node/health"
 	nodehydration "sigs.k8s.io/karpenter/pkg/controllers/node/hydration"
 	"sigs.k8s.io/karpenter/pkg/controllers/node/termination"
@@ -71,7 +70,7 @@ func NewControllers(
 ) []controller.Controller {
 	p := provisioningdynamic.NewController(kubeClient, recorder, cloudProvider, cluster, clock)
 	evictionQueue := terminator.NewQueue(kubeClient, recorder)
-	disruptionQueue := orchestration.NewQueue(kubeClient, recorder, cluster, clock)
+	disruptionQueue := disruption.NewQueue(kubeClient, recorder, cluster, clock)
 
 	controllers := []controller.Controller{
 		p, evictionQueue, disruptionQueue,

@@ -36,7 +36,6 @@ import (
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	disruptionevents "sigs.k8s.io/karpenter/pkg/controllers/disruption/events"
-	"sigs.k8s.io/karpenter/pkg/controllers/disruption/orchestration"
 	pscheduling "sigs.k8s.io/karpenter/pkg/controllers/provisioning/scheduling"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/events"
@@ -54,7 +53,7 @@ const MinInstanceTypesForSpotToSpotConsolidation = 15
 // consolidation methods.
 type consolidation struct {
 	// Consolidation needs to be aware of the queue for validation
-	queue                  *orchestration.Queue
+	queue                  *Queue
 	clock                  clock.Clock
 	cluster                *state.Cluster
 	kubeClient             client.Client
@@ -65,7 +64,7 @@ type consolidation struct {
 }
 
 func MakeConsolidation(clock clock.Clock, cluster *state.Cluster, kubeClient client.Client, controller *provisioningdynamic.Controller,
-	cloudProvider cloudprovider.CloudProvider, recorder events.Recorder, queue *orchestration.Queue) consolidation {
+	cloudProvider cloudprovider.CloudProvider, recorder events.Recorder, queue *Queue) consolidation {
 	return consolidation{
 		queue:         queue,
 		clock:         clock,
@@ -160,8 +159,8 @@ func (c *consolidation) computeConsolidation(ctx context.Context, candidates ...
 	// were we able to schedule all the pods on the inflight candidates?
 	if len(results.NewNodeClaims) == 0 {
 		return Command{
-			candidates: candidates,
-			results:    results,
+			Candidates: candidates,
+			Results:    results,
 		}, nil
 	}
 
@@ -226,9 +225,9 @@ func (c *consolidation) computeConsolidation(ctx context.Context, candidates ...
 	}
 
 	return Command{
-		candidates:   candidates,
-		replacements: results.NewNodeClaims,
-		results:      results,
+		Candidates:   candidates,
+		Replacements: lo.Map(results.NewNodeClaims, func(n *pscheduling.NodeClaim, _ int) *Replacement { return &Replacement{NodeClaim: n} }),
+		Results:      results,
 	}, nil
 }
 
@@ -237,8 +236,7 @@ func (c *consolidation) computeConsolidation(ctx context.Context, candidates ...
 //  2. For single-node consolidation:
 //     a. There are at least 15 cheapest instance type replacement options to consolidate.
 //     b. The current candidate is NOT part of the first 15 cheapest instance types inorder to avoid repeated consolidation.
-func (c *consolidation) computeSpotToSpotConsolidation(ctx context.Context, candidates []*Candidate, results pscheduling.Results,
-	candidatePrice float64) (Command, error) {
+func (c *consolidation) computeSpotToSpotConsolidation(ctx context.Context, candidates []*Candidate, results pscheduling.Results, candidatePrice float64) (Command, error) {
 
 	// Spot consolidation is turned off.
 	if !options.FromContext(ctx).FeatureGates.SpotToSpotConsolidation {
@@ -273,9 +271,9 @@ func (c *consolidation) computeSpotToSpotConsolidation(ctx context.Context, cand
 	// We don't have any requirement to check the remaining instance type flexibility, so exit early in this case.
 	if len(candidates) > 1 {
 		return Command{
-			candidates:   candidates,
-			replacements: results.NewNodeClaims,
-			results:      results,
+			Candidates:   candidates,
+			Replacements: lo.Map(results.NewNodeClaims, func(n *pscheduling.NodeClaim, _ int) *Replacement { return &Replacement{NodeClaim: n} }),
+			Results:      results,
 		}, nil
 	}
 
@@ -308,9 +306,9 @@ func (c *consolidation) computeSpotToSpotConsolidation(ctx context.Context, cand
 	}
 
 	return Command{
-		candidates:   candidates,
-		replacements: results.NewNodeClaims,
-		results:      results,
+		Candidates:   candidates,
+		Replacements: lo.Map(results.NewNodeClaims, func(n *pscheduling.NodeClaim, _ int) *Replacement { return &Replacement{NodeClaim: n} }),
+		Results:      results,
 	}, nil
 }
 

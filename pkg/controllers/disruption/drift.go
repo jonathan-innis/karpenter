@@ -25,6 +25,7 @@ import (
 	"github.com/samber/lo"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+
 	"sigs.k8s.io/karpenter/pkg/controllers/provisioning/scheduling"
 
 	provisioningdynamic "sigs.k8s.io/karpenter/pkg/controllers/provisioning/dynamic"
@@ -59,7 +60,9 @@ func (d *Drift) ShouldDisrupt(_ context.Context, c *Candidate) bool {
 	return c.NodeClaim.StatusConditions().Get(string(d.Reason())).IsTrue()
 }
 
-// ComputeCommands generates disruption commands given candidates
+// ComputeCommands generates a disruption command given candidates
+//
+//nolint:gocyclo
 func (d *Drift) ComputeCommands(ctx context.Context, disruptionBudgetMapping map[string]int, candidates ...*Candidate) ([]Command, error) {
 	sort.Slice(candidates, func(i int, j int) bool {
 		return candidates[i].NodeClaim.StatusConditions().Get(string(d.Reason())).LastTransitionTime.Time.Before(
@@ -116,9 +119,9 @@ func (d *Drift) ComputeCommands(ctx context.Context, disruptionBudgetMapping map
 			continue
 		}
 		cmds = append(cmds, Command{
-			candidates:   []*Candidate{candidate},
-			replacements: results.NewNodeClaims,
-			results:      results,
+			Candidates:   []*Candidate{candidate},
+			Replacements: lo.Map(results.NewNodeClaims, func(n *scheduling.NodeClaim, _ int) *Replacement { return &Replacement{NodeClaim: n} }),
+			Results:      results,
 		})
 	}
 	return cmds, nil
