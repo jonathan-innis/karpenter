@@ -644,7 +644,7 @@ func (s *Scheduler) calculateExistingNodeClaims(stateNodes []*state.StateNode, d
 func (s *Scheduler) calculateStaticNodeClaims(staticNodePools []*v1.NodePool) {
 	nodePoolToNodeMap := lo.GroupBy(s.existingNodes, func(n *ExistingNode) string { return n.Labels()[v1.NodePoolLabelKey] })
 	for _, nodePool := range staticNodePools {
-		nodeClaimCount := int64(len(nodePoolToNodeMap[nodePool.Name])) - lo.FromPtr(nodePool.Spec.Replicas)
+		nodeClaimCount := lo.FromPtr(nodePool.Spec.Replicas) - int64(len(nodePoolToNodeMap[nodePool.Name]))
 		nct := NewNodeClaimTemplate(nodePool)
 		for range nodeClaimCount {
 			// TODO: Eventually we should support scoping down the instance type options here by limits

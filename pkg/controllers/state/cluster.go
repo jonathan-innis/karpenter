@@ -334,7 +334,9 @@ func (c *Cluster) UpdateNodeClaim(nodeClaim *v1.NodeClaim) {
 	} else {
 		c.nodePoolNameToNodeClaims[nodeClaim.Labels[v1.NodePoolLabelKey]].Insert(nodeClaim.Name)
 	}
-	ClusterStateNodesCount.Set(float64(len(c.nodes)), nil)
+	markedForDeletionNodeCount := lo.CountBy(lo.Values(c.nodes), func(n *StateNode) bool { return n.markedForDeletion })
+	ClusterStateNodesCount.Set(float64(markedForDeletionNodeCount), map[string]string{"marked_for_deletion": "true"})
+	ClusterStateNodesCount.Set(float64(len(c.nodes)), map[string]string{"marked_for_deletion": "false"})
 }
 
 func (c *Cluster) DeleteNodeClaim(name string) {
@@ -347,7 +349,9 @@ func (c *Cluster) DeleteNodeClaim(name string) {
 	if v, ok := c.nodePoolNameToNodeClaims[nodePoolName]; ok {
 		v.Delete(name)
 	}
-	ClusterStateNodesCount.Set(float64(len(c.nodes)), nil)
+	markedForDeletionNodeCount := lo.CountBy(lo.Values(c.nodes), func(n *StateNode) bool { return n.markedForDeletion })
+	ClusterStateNodesCount.Set(float64(markedForDeletionNodeCount), map[string]string{"marked_for_deletion": "true"})
+	ClusterStateNodesCount.Set(float64(len(c.nodes)), map[string]string{"marked_for_deletion": "false"})
 }
 
 func (c *Cluster) UpdateNode(ctx context.Context, node *corev1.Node) error {
@@ -374,7 +378,9 @@ func (c *Cluster) UpdateNode(ctx context.Context, node *corev1.Node) error {
 	}
 	c.nodes[node.Spec.ProviderID] = n
 	c.nodeNameToProviderID[node.Name] = node.Spec.ProviderID
-	ClusterStateNodesCount.Set(float64(len(c.nodes)), nil)
+	markedForDeletionNodeCount := lo.CountBy(lo.Values(c.nodes), func(n *StateNode) bool { return n.markedForDeletion })
+	ClusterStateNodesCount.Set(float64(markedForDeletionNodeCount), map[string]string{"marked_for_deletion": "true"})
+	ClusterStateNodesCount.Set(float64(len(c.nodes)), map[string]string{"marked_for_deletion": "false"})
 	return nil
 }
 
@@ -382,7 +388,9 @@ func (c *Cluster) DeleteNode(name string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.cleanupNode(name)
-	ClusterStateNodesCount.Set(float64(len(c.nodes)), nil)
+	markedForDeletionNodeCount := lo.CountBy(lo.Values(c.nodes), func(n *StateNode) bool { return n.markedForDeletion })
+	ClusterStateNodesCount.Set(float64(markedForDeletionNodeCount), map[string]string{"marked_for_deletion": "true"})
+	ClusterStateNodesCount.Set(float64(len(c.nodes)), map[string]string{"marked_for_deletion": "false"})
 }
 
 func (c *Cluster) UpdatePod(ctx context.Context, pod *corev1.Pod) error {

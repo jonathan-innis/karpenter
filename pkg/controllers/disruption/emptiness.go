@@ -64,7 +64,7 @@ func (e *Emptiness) ComputeCommands(ctx context.Context, disruptionBudgetMapping
 
 	empty := make([]*Candidate, 0, len(candidates))
 	constrainedByBudgets := false
-	nodePoolDiffMapping := map[string]int{}
+	nodePoolCandidateMapping := map[string]int{}
 	for _, candidate := range candidates {
 		if len(candidate.reschedulablePods) > 0 {
 			continue
@@ -75,11 +75,10 @@ func (e *Emptiness) ComputeCommands(ctx context.Context, disruptionBudgetMapping
 			continue
 		}
 		if candidate.NodePool.Spec.Replicas != nil {
-			nodeQuantity := e.cluster.NodePoolNodesFor(candidate.NodePool.Name)
 			// If total number of current nodes for a NodePool minus the Nodes we are about to disrupt
 			// is less than or equal to the desired count, we shouldn't disrupt the empty node since we should
 			// maintain this static capacity to match the desired replicas on the NodePool
-			if int(lo.FromPtr(candidate.NodePool.Spec.Replicas)) >= nodeQuantity+nodePoolDiffMapping[candidate.NodePool.Name] {
+			if int(lo.FromPtr(candidate.NodePool.Spec.Replicas)) >= e.cluster.NodePoolNodesFor(candidate.NodePool.Name)-nodePoolCandidateMapping[candidate.NodePool.Name] {
 				continue
 			}
 		}
@@ -87,7 +86,7 @@ func (e *Emptiness) ComputeCommands(ctx context.Context, disruptionBudgetMapping
 		// add it to the list of candidates, and decrement the budget.
 		empty = append(empty, candidate)
 		disruptionBudgetMapping[candidate.NodePool.Name]--
-		nodePoolDiffMapping[candidate.NodePool.Name]--
+		nodePoolCandidateMapping[candidate.NodePool.Name]++
 	}
 	// none empty, so do nothing
 	if len(empty) == 0 {

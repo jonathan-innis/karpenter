@@ -23,7 +23,6 @@ import (
 
 	"github.com/awslabs/operatorpkg/serrors"
 	"github.com/samber/lo"
-	"golang.org/x/time/rate"
 	corev1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
@@ -392,8 +391,6 @@ func (c *Controller) Register(_ context.Context, m manager.Manager) error {
 			controller.Options{
 				RateLimiter: workqueue.NewTypedMaxOfRateLimiter[reconcile.Request](
 					workqueue.NewTypedItemExponentialFailureRateLimiter[reconcile.Request](100*time.Millisecond, 10*time.Second),
-					// 10 qps, 100 bucket size
-					&workqueue.TypedBucketRateLimiter[reconcile.Request]{Limiter: rate.NewLimiter(rate.Limit(10), 100)},
 				),
 				MaxConcurrentReconciles: 5000,
 			},
