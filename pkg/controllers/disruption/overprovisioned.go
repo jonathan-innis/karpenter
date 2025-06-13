@@ -104,6 +104,7 @@ func (o *Overprovisioned) ComputeCommands(ctx context.Context, disruptionBudgetM
 			o.recorder.Publish(disruptionevents.Blocked(candidate.Node, candidate.NodeClaim, pretty.Sentence(results.NonPendingPodSchedulingErrors()))...)
 			continue
 		}
+		disruptionBudgetMapping[candidate.NodePool.Name]--
 		cmds = append(cmds, Command{
 			Candidates:   []*Candidate{candidate},
 			Replacements: replacementsFromNodeClaims(results.NewNodeClaims...),
