@@ -118,6 +118,7 @@ func (d *Drift) ComputeCommands(ctx context.Context, disruptionBudgetMapping map
 			d.recorder.Publish(disruptionevents.Blocked(candidate.Node, candidate.NodeClaim, pretty.Sentence(results.NonPendingPodSchedulingErrors()))...)
 			continue
 		}
+		disruptionBudgetMapping[candidate.NodePool.Name]--
 		cmds = append(cmds, Command{
 			Candidates:   []*Candidate{candidate},
 			Replacements: lo.Map(results.NewNodeClaims, func(n *scheduling.NodeClaim, _ int) *Replacement { return &Replacement{NodeClaim: n} }),
