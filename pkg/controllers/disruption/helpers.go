@@ -27,7 +27,6 @@ import (
 	"k8s.io/utils/clock"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
-
 	"sigs.k8s.io/karpenter/pkg/operator/options"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
@@ -145,12 +144,10 @@ func SimulateScheduling(ctx context.Context, kubeClient client.Client, cluster *
 	// We should only launch static nodes equivalent to the count that we are disrupting
 	// The other NodeClaims will get launched by the provisioner and should come eventually
 	results.NewNodeClaims = lo.Filter(results.NewNodeClaims, func(n *scheduling.NodeClaim, _ int) bool {
-		if v, ok := staticNodeMapping[n.NodePoolName]; ok {
-			if v == 0 {
-				return false
-			}
-			staticNodeMapping[n.NodePoolName]--
+		if n.IsStaticNode && staticNodeMapping[n.NodePoolName] == 0 {
+			return false
 		}
+		staticNodeMapping[n.NodePoolName]--
 		return true
 	})
 	return results, nil
