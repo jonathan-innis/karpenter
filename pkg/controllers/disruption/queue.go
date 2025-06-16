@@ -153,7 +153,6 @@ func (q *Queue) Reconcile(ctx context.Context, nodeClaim *v1.NodeClaim) (reconci
 		multiErr = multierr.Combine(multiErr, state.ClearNodeClaimsCondition(ctx, q.kubeClient, v1.ConditionTypeDisruptionReason, stateNodes...))
 		// Log the error
 		log.FromContext(ctx).Error(multiErr, "failed terminating nodes while executing a disruption command")
-		q.CompleteCommand(cmd, false)
 	} else {
 		log.FromContext(ctx).V(1).Info("command succeeded")
 		cmd.Succeeded = true
@@ -283,45 +282,10 @@ func (q *Queue) createReplacementNodeClaims(ctx context.Context, cmd *Command) e
 // 2. Spin up replacement nodes
 // 3. Add Command to the queue to wait to delete the candidates.
 func (q *Queue) StartCommand(ctx context.Context, cmd *Command) error {
-	providerIDs := lo.Map(cmd.Candidates, func(c *Candidate, _ int) string {
-		return c.ProviderID()
-	})
-	var markedCandidates []*Candidate
-	for i := range errs {
-		if errs[i] != nil {
-			continue
-		}
-		markedCandidates = append(markedCandidates, cmd.Candidates[i])
-	}
-	return markedCandidates, multierr.Combine(errs...)
-}
-
-// createReplacementNodeClaims creates replacement NodeClaims
-func (q *Queue) createReplacementNodeClaims(ctx context.Context, cmd *Command) error {
-	nodeClaimNames, err := q.provisioner.CreateNodeClaims(ctx, lo.Map(cmd.Replacements, func(r *Replacement, _ int) *pscheduling.NodeClaim { return r.NodeClaim }), provisioning.WithReason(strings.ToLower(string(cmd.Reason()))))
-	if err != nil {
-		return err
-	}
-	if len(nodeClaimNames) != len(cmd.Replacements) {
-		// shouldn't ever occur since a partially failed CreateNodeClaims should return an error
-		return serrors.Wrap(fmt.Errorf("expected replacement count did not equal actual replacement count"), "expected-count", len(cmd.Replacements), "actual-count", len(nodeClaimNames))
-	}
-	for i, name := range nodeClaimNames {
-		cmd.Replacements[i].Name = name
-	}
-	return nil
-}
-
-// StartCommand will do the following:
-// 1. Taint candidate nodes
-// 2. Spin up replacement nodes
-// 3. Add Command to the queue to wait to delete the candidates.
-func (q *Queue) StartCommand(ctx context.Context, cmd *Command) error {
 	// First check if we can add the command.
-	providerIDs := lo.Map(cmd.Candidates, func(c *Candidate, _ int) string {
+	if q.HasAny(lo.Map(cmd.Candidates, func(c *Candidate, _ int) string {
 		return c.ProviderID()
-	})
-	if q.HasAny(providerIDs...) {
+	})...) {
 		return fmt.Errorf("candidate is being disrupted")
 	}
 
@@ -371,7 +335,9 @@ func (q *Queue) StartCommand(ctx context.Context, cmd *Command) error {
 	// If we MarkForDeletion before we create replacements, it's possible for the provisioner
 	// to recognize that it needs to launch capacity for terminating pods, causing us to launch
 	// capacity for these pods twice instead of just once
-	q.cluster.MarkForDeletion(lo.Map(cmd.Candidates, func(c *Candidate, _ int) string { return c.ProviderID() })...)
+	q.cluster.MarkForDeletion(lo.Map(cmd.Candidates, func(c *Candidate, _ int) string {
+		return c.ProviderID()
+	})...)
 	// An action is only performed and pods/nodes are only disrupted after a successful add to the queue
 	DecisionsPerformedTotal.Inc(map[string]string{
 		decisionLabel:          string(cmd.Decision()),
