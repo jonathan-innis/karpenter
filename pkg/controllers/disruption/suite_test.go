@@ -31,8 +31,6 @@ import (
 	provisioningdynamic "sigs.k8s.io/karpenter/pkg/controllers/provisioning/dynamic"
 	pscheduling "sigs.k8s.io/karpenter/pkg/controllers/provisioning/scheduling"
 
-	pscheduling "sigs.k8s.io/karpenter/pkg/controllers/provisioning/scheduling"
-
 	"sigs.k8s.io/karpenter/pkg/events"
 	"sigs.k8s.io/karpenter/pkg/metrics"
 

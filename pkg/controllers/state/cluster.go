@@ -292,6 +292,11 @@ func (c *Cluster) UnmarkForDeletion(providerIDs ...string) {
 			oldNode := n.ShallowCopy()
 			n.markedForDeletion = false
 			c.updateNodePoolResources(oldNode, n)
+			if n.NodeClaim != nil && !n.MarkedForDeletion() {
+				if v, ok := c.nodePoolNameToNodeClaims[n.NodeClaim.Labels[v1.NodePoolLabelKey]]; ok {
+					v.Delete(n.NodeClaim.Name)
+				}
+			}
 		}
 	}
 }
@@ -306,6 +311,11 @@ func (c *Cluster) MarkForDeletion(providerIDs ...string) {
 			oldNode := n.ShallowCopy()
 			n.markedForDeletion = true
 			c.updateNodePoolResources(oldNode, n)
+			if n.NodeClaim != nil {
+				if v, ok := c.nodePoolNameToNodeClaims[n.NodeClaim.Labels[v1.NodePoolLabelKey]]; ok {
+					v.Insert(n.NodeClaim.Name)
+				}
+			}
 		}
 	}
 }
@@ -329,7 +339,7 @@ func (c *Cluster) UpdateNodeClaim(nodeClaim *v1.NodeClaim) {
 		c.nodePoolNameToNodeClaims[nodeClaim.Labels[v1.NodePoolLabelKey]] = sets.New[string]()
 	}
 	// If our node is marked for deletion, we need to make sure that we delete it from node tracking
-	if nodeClaim.Status.ProviderID != "" && c.nodes[nodeClaim.Status.ProviderID].markedForDeletion {
+	if nodeClaim.Status.ProviderID != "" && c.nodes[nodeClaim.Status.ProviderID].MarkedForDeletion() {
 		c.nodePoolNameToNodeClaims[nodeClaim.Labels[v1.NodePoolLabelKey]].Delete(nodeClaim.Name)
 	} else {
 		c.nodePoolNameToNodeClaims[nodeClaim.Labels[v1.NodePoolLabelKey]].Insert(nodeClaim.Name)
