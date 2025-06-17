@@ -19,9 +19,11 @@ package static
 import (
 	"context"
 	"fmt"
+	"math"
 	"time"
 
 	"github.com/samber/lo"
+	corev1 "k8s.io/api/core/v1"
 	controllerruntime "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -79,14 +81,20 @@ func (c *Controller) Reconcile(ctx context.Context, np *v1.NodePool) (reconcile.
 	if !c.cluster.HasSynced() {
 		return reconcile.Result{RequeueAfter: time.Second}, nil
 	}
-	nodes := c.cluster.NodePoolNodesFor(np.Name)
-	if nodes >= int(lo.FromPtr(np.Spec.Replicas)) {
+	runningNodes := c.cluster.NodePoolNodesFor(np.Name)
+	totalNodes := c.cluster.TotalNodePoolNodesFor(np.Name)
+	nodeLimit := int64(math.MaxInt64)
+	if v, ok := np.Spec.Limits[corev1.ResourceName("nodes")]; ok {
+		nodeLimit = v.Value()
+	}
+	if runningNodes >= int(lo.FromPtr(np.Spec.Replicas)) || totalNodes >= int(nodeLimit) {
 		return reconcile.Result{RequeueAfter: time.Minute}, nil
 	}
+
 	// Create the number of NodeClaims equal to the desired replica count
 	var nodeClaims []*scheduling.NodeClaim
 	nct := scheduling.NewNodeClaimTemplate(np)
-	for range int(lo.FromPtr(np.Spec.Replicas)) - nodes {
+	for range lo.Min([]int{int(lo.FromPtr(np.Spec.Replicas)) - runningNodes, int(nodeLimit) - totalNodes}) {
 		nodeClaims = append(nodeClaims, &scheduling.NodeClaim{NodeClaimTemplate: *nct})
 	}
 	if _, err := c.provisioner.CreateNodeClaims(ctx, nodeClaims, provisioning.WithReason(metrics.ProvisionedReason)); err != nil {
