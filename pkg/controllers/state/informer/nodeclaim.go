@@ -73,6 +73,6 @@ func (c *NodeClaimController) Register(_ context.Context, m manager.Manager) err
 	return controllerruntime.NewControllerManagedBy(m).
 		Named("state.nodeclaim").
 		For(&v1.NodeClaim{}, builder.WithPredicates(nodeclaimutils.IsManagedPredicateFuncs(c.cloudProvider))).
-		WithOptions(controller.Options{MaxConcurrentReconciles: informerReconcilers}).
+		WithOptions(controller.Options{MaxConcurrentReconciles: 3001}).
 		Complete(c)
 }

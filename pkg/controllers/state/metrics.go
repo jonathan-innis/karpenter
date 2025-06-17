@@ -37,7 +37,7 @@ var (
 			Name:      "node_count",
 			Help:      "Current count of nodes in cluster state",
 		},
-		[]string{"marked_for_deletion"},
+		[]string{},
 	)
 	ClusterStateSynced = opmetrics.NewPrometheusGauge(
 		crmetrics.Registry,

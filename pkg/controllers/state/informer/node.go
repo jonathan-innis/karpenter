@@ -67,6 +67,6 @@ func (c *NodeController) Register(_ context.Context, m manager.Manager) error {
 	return controllerruntime.NewControllerManagedBy(m).
 		Named("state.node").
 		For(&v1.Node{}).
-		WithOptions(controller.Options{MaxConcurrentReconciles: informerReconcilers}).
+		WithOptions(controller.Options{MaxConcurrentReconciles: 3001}).
 		Complete(c)
 }

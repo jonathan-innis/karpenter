@@ -20,8 +20,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 
 	"github.com/samber/lo"
+	corev1 "k8s.io/api/core/v1"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
@@ -75,10 +77,15 @@ func (e *Emptiness) ComputeCommands(ctx context.Context, disruptionBudgetMapping
 			continue
 		}
 		if candidate.NodePool.Spec.Replicas != nil {
+			nodeLimit := int64(math.MaxInt64)
+			if v, ok := candidate.NodePool.Spec.Limits[corev1.ResourceName("nodes")]; ok {
+				nodeLimit = v.Value()
+			}
 			// If total number of current nodes for a NodePool minus the Nodes we are about to disrupt
 			// is less than or equal to the desired count, we shouldn't disrupt the empty node since we should
 			// maintain this static capacity to match the desired replicas on the NodePool
-			if int(lo.FromPtr(candidate.NodePool.Spec.Replicas)) >= e.cluster.NodePoolNodesFor(candidate.NodePool.Name)-nodePoolCandidateMapping[candidate.NodePool.Name] {
+			if int(lo.FromPtr(candidate.NodePool.Spec.Replicas)) >= e.cluster.NodePoolNodesFor(candidate.NodePool.Name)-nodePoolCandidateMapping[candidate.NodePool.Name] &&
+				int(nodeLimit) >= e.cluster.NodePoolNodesFor(candidate.NodePool.Name)-nodePoolCandidateMapping[candidate.NodePool.Name] {
 				continue
 			}
 		}

@@ -72,6 +72,6 @@ func (c *PodController) Register(_ context.Context, m manager.Manager) error {
 	return controllerruntime.NewControllerManagedBy(m).
 		Named("state.pod").
 		For(&v1.Pod{}).
-		WithOptions(controller.Options{MaxConcurrentReconciles: informerReconcilers}).
+		WithOptions(controller.Options{MaxConcurrentReconciles: 3001}).
 		Complete(c)
 }

@@ -646,7 +646,11 @@ func (s *Scheduler) calculateStaticNodeClaims(staticNodePools []*v1.NodePool) {
 	for _, nodePool := range staticNodePools {
 		nodeClaimCount := lo.FromPtr(nodePool.Spec.Replicas) - int64(len(nodePoolToNodeMap[nodePool.Name]))
 		nct := NewNodeClaimTemplate(nodePool)
-		for range nodeClaimCount {
+		nodeLimit := int64(math.MaxInt64)
+		if v, ok := nodePool.Spec.Limits[corev1.ResourceName("nodes")]; ok {
+			nodeLimit = v.Value()
+		}
+		for range lo.Min([]int{int(nodeClaimCount), int(nodeLimit) - s.cluster.TotalNodePoolNodesFor(nodePool.Name)}) {
 			// TODO: Eventually we should support scoping down the instance type options here by limits
 			nc := NewNodeClaim(nct, s.topology, s.daemonOverhead[nct], s.daemonHostPortUsage[nct], nct.InstanceTypeOptions, s.reservationManager, s.reservedOfferingMode)
 			nc.IsStaticNode = true
