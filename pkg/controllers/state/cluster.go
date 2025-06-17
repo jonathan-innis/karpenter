@@ -49,6 +49,11 @@ import (
 	"sigs.k8s.io/karpenter/pkg/utils/resources"
 )
 
+type NodeClaimTracking struct {
+	Running  sets.Set[string]
+	Deleting sets.Set[string]
+}
+
 // Cluster maintains cluster state that is often needed but expensive to compute.
 type Cluster struct {
 	kubeClient    client.Client
@@ -63,7 +68,7 @@ type Cluster struct {
 	nodeClaimNameToProviderID   map[string]string               // node claim name -> provider id
 	nodePoolResources           map[string]corev1.ResourceList  // node pool name -> resource list
 	nodeClaimNameToNodePoolName map[string]string               // nodeclaim name -> nodepool name
-	nodePoolNameToNodeClaims    map[string]sets.Set[string]     // node pool name -> node claim names
+	nodePoolNameToNodeClaims    map[string]NodeClaimTracking    // node pool name -> node claim names
 	daemonSetPods               sync.Map                        // daemonSet -> existing pod
 
 	podAcks                         sync.Map // pod namespaced name -> time when Karpenter first saw the pod as pending
@@ -98,7 +103,7 @@ func NewCluster(clk clock.Clock, client client.Client, cloudProvider cloudprovid
 		nodeClaimNameToProviderID:   map[string]string{},
 		nodePoolResources:           map[string]corev1.ResourceList{},
 		nodeClaimNameToNodePoolName: map[string]string{},
-		nodePoolNameToNodeClaims:    map[string]sets.Set[string]{},
+		nodePoolNameToNodeClaims:    map[string]NodeClaimTracking{},
 
 		podAcks:                         sync.Map{},
 		podsSchedulableTimes:            sync.Map{},
@@ -294,7 +299,8 @@ func (c *Cluster) UnmarkForDeletion(providerIDs ...string) {
 			c.updateNodePoolResources(oldNode, n)
 			if n.NodeClaim != nil && !n.MarkedForDeletion() {
 				if v, ok := c.nodePoolNameToNodeClaims[n.NodeClaim.Labels[v1.NodePoolLabelKey]]; ok {
-					v.Delete(n.NodeClaim.Name)
+					v.Running.Insert(n.NodeClaim.Name)
+					v.Deleting.Delete(n.NodeClaim.Name)
 				}
 			}
 		}
@@ -313,7 +319,8 @@ func (c *Cluster) MarkForDeletion(providerIDs ...string) {
 			c.updateNodePoolResources(oldNode, n)
 			if n.NodeClaim != nil {
 				if v, ok := c.nodePoolNameToNodeClaims[n.NodeClaim.Labels[v1.NodePoolLabelKey]]; ok {
-					v.Insert(n.NodeClaim.Name)
+					v.Running.Delete(n.NodeClaim.Name)
+					v.Deleting.Insert(n.NodeClaim.Name)
 				}
 			}
 		}
@@ -336,17 +343,17 @@ func (c *Cluster) UpdateNodeClaim(nodeClaim *v1.NodeClaim) {
 	c.nodeClaimNameToProviderID[nodeClaim.Name] = nodeClaim.Status.ProviderID
 	c.nodeClaimNameToNodePoolName[nodeClaim.Name] = nodeClaim.Labels[v1.NodePoolLabelKey]
 	if _, ok := c.nodePoolNameToNodeClaims[nodeClaim.Labels[v1.NodePoolLabelKey]]; !ok {
-		c.nodePoolNameToNodeClaims[nodeClaim.Labels[v1.NodePoolLabelKey]] = sets.New[string]()
+		c.nodePoolNameToNodeClaims[nodeClaim.Labels[v1.NodePoolLabelKey]] = NodeClaimTracking{Running: sets.New[string](), Deleting: sets.New[string]()}
 	}
 	// If our node is marked for deletion, we need to make sure that we delete it from node tracking
 	if nodeClaim.Status.ProviderID != "" && c.nodes[nodeClaim.Status.ProviderID].MarkedForDeletion() {
-		c.nodePoolNameToNodeClaims[nodeClaim.Labels[v1.NodePoolLabelKey]].Delete(nodeClaim.Name)
+		c.nodePoolNameToNodeClaims[nodeClaim.Labels[v1.NodePoolLabelKey]].Running.Delete(nodeClaim.Name)
+		c.nodePoolNameToNodeClaims[nodeClaim.Labels[v1.NodePoolLabelKey]].Deleting.Insert(nodeClaim.Name)
 	} else {
-		c.nodePoolNameToNodeClaims[nodeClaim.Labels[v1.NodePoolLabelKey]].Insert(nodeClaim.Name)
+		c.nodePoolNameToNodeClaims[nodeClaim.Labels[v1.NodePoolLabelKey]].Deleting.Delete(nodeClaim.Name)
+		c.nodePoolNameToNodeClaims[nodeClaim.Labels[v1.NodePoolLabelKey]].Running.Insert(nodeClaim.Name)
 	}
-	markedForDeletionNodeCount := lo.CountBy(lo.Values(c.nodes), func(n *StateNode) bool { return n.markedForDeletion })
-	ClusterStateNodesCount.Set(float64(markedForDeletionNodeCount), map[string]string{"marked_for_deletion": "true"})
-	ClusterStateNodesCount.Set(float64(len(c.nodes)), map[string]string{"marked_for_deletion": "false"})
+	ClusterStateNodesCount.Set(float64(len(c.nodes)), nil)
 }
 
 func (c *Cluster) DeleteNodeClaim(name string) {
@@ -357,11 +364,10 @@ func (c *Cluster) DeleteNodeClaim(name string) {
 	nodePoolName := c.nodeClaimNameToNodePoolName[name]
 	delete(c.nodeClaimNameToNodePoolName, name)
 	if v, ok := c.nodePoolNameToNodeClaims[nodePoolName]; ok {
-		v.Delete(name)
+		v.Running.Delete(name)
+		v.Deleting.Delete(name)
 	}
-	markedForDeletionNodeCount := lo.CountBy(lo.Values(c.nodes), func(n *StateNode) bool { return n.markedForDeletion })
-	ClusterStateNodesCount.Set(float64(markedForDeletionNodeCount), map[string]string{"marked_for_deletion": "true"})
-	ClusterStateNodesCount.Set(float64(len(c.nodes)), map[string]string{"marked_for_deletion": "false"})
+	ClusterStateNodesCount.Set(float64(len(c.nodes)), nil)
 }
 
 func (c *Cluster) UpdateNode(ctx context.Context, node *corev1.Node) error {
@@ -388,9 +394,7 @@ func (c *Cluster) UpdateNode(ctx context.Context, node *corev1.Node) error {
 	}
 	c.nodes[node.Spec.ProviderID] = n
 	c.nodeNameToProviderID[node.Name] = node.Spec.ProviderID
-	markedForDeletionNodeCount := lo.CountBy(lo.Values(c.nodes), func(n *StateNode) bool { return n.markedForDeletion })
-	ClusterStateNodesCount.Set(float64(markedForDeletionNodeCount), map[string]string{"marked_for_deletion": "true"})
-	ClusterStateNodesCount.Set(float64(len(c.nodes)), map[string]string{"marked_for_deletion": "false"})
+	ClusterStateNodesCount.Set(float64(len(c.nodes)), nil)
 	return nil
 }
 
@@ -398,9 +402,7 @@ func (c *Cluster) DeleteNode(name string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.cleanupNode(name)
-	markedForDeletionNodeCount := lo.CountBy(lo.Values(c.nodes), func(n *StateNode) bool { return n.markedForDeletion })
-	ClusterStateNodesCount.Set(float64(markedForDeletionNodeCount), map[string]string{"marked_for_deletion": "true"})
-	ClusterStateNodesCount.Set(float64(len(c.nodes)), map[string]string{"marked_for_deletion": "false"})
+	ClusterStateNodesCount.Set(float64(len(c.nodes)), nil)
 }
 
 func (c *Cluster) UpdatePod(ctx context.Context, pod *corev1.Pod) error {
@@ -593,11 +595,18 @@ func (c *Cluster) NodePoolResourcesFor(nodePoolName string) corev1.ResourceList 
 	return maps.Clone(c.nodePoolResources[nodePoolName])
 }
 
+func (c *Cluster) TotalNodePoolNodesFor(nodePoolName string) int {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	return c.nodePoolNameToNodeClaims[nodePoolName].Running.Len() + c.nodePoolNameToNodeClaims[nodePoolName].Deleting.Len()
+}
+
 func (c *Cluster) NodePoolNodesFor(nodePoolName string) int {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
-	return c.nodePoolNameToNodeClaims[nodePoolName].Len()
+	return c.nodePoolNameToNodeClaims[nodePoolName].Running.Len()
 }
 
 // Reset the cluster state for unit testing
