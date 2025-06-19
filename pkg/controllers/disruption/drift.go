@@ -19,10 +19,13 @@ package disruption
 import (
 	"context"
 	"errors"
+	"math"
 	"sort"
 	"time"
 
 	"github.com/samber/lo"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
@@ -73,6 +76,7 @@ func (d *Drift) ComputeCommands(ctx context.Context, disruptionBudgetMapping map
 	defer cancel()
 
 	var cmds []Command
+	nodePoolCandidateMapping := map[string]int{}
 	for _, candidate := range candidates {
 		log.FromContext(ctx).WithValues("candidate", candidate.NodeClaim.Name).Info("considering candidate for drift")
 		if timeoutCtx.Err() != nil {
@@ -94,7 +98,11 @@ func (d *Drift) ComputeCommands(ctx context.Context, disruptionBudgetMapping map
 
 		var results scheduling.Results
 		var err error
-		if candidate.NodePool.Spec.Replicas != nil && d.cluster.NodePoolNodesFor(candidate.NodePool.Name) <= int(lo.FromPtr(candidate.NodePool.Spec.Replicas)) {
+		nodeLimit := int64(math.MaxInt64)
+		if v, ok := candidate.NodePool.Spec.Limits[corev1.ResourceName("nodes")]; ok {
+			nodeLimit = v.Value()
+		}
+		if candidate.NodePool.Spec.Replicas != nil && d.cluster.NodePoolNodesFor(candidate.NodePool.Name) <= lo.Min([]int{int(lo.FromPtr(candidate.NodePool.Spec.Replicas)), int(nodeLimit)}) {
 			results = scheduling.Results{
 				NewNodeClaims: []*scheduling.NodeClaim{{NodeClaimTemplate: *scheduling.NewNodeClaimTemplate(candidate.NodePool), Pods: candidate.reschedulablePods}},
 			}
@@ -112,13 +120,32 @@ func (d *Drift) ComputeCommands(ctx context.Context, disruptionBudgetMapping map
 				return nil, err
 			}
 		}
-
+		validCommand := true
+		for nodePoolName, nodeClaims := range lo.GroupBy(results.NewNodeClaims, func(n *scheduling.NodeClaim) string { return n.NodePoolName }) {
+			nodePool := &v1.NodePool{}
+			if err = d.kubeClient.Get(ctx, types.NamespacedName{Name: nodePoolName}, nodePool); err != nil {
+				validCommand = false
+				break
+			}
+			nodeLimit = int64(math.MaxInt64)
+			if v, ok := nodePool.Spec.Limits[corev1.ResourceName("nodes")]; ok {
+				nodeLimit = v.Value()
+			}
+			if d.cluster.TotalNodePoolNodesFor(nodePoolName)+nodePoolCandidateMapping[nodePoolName]+len(nodeClaims) > int(nodeLimit) {
+				validCommand = false
+				break
+			}
+		}
+		if !validCommand {
+			continue
+		}
 		// Emit an event that we couldn't reschedule the pods on the node.
 		if !results.AllNonPendingPodsScheduled() {
 			d.recorder.Publish(disruptionevents.Blocked(candidate.Node, candidate.NodeClaim, pretty.Sentence(results.NonPendingPodSchedulingErrors()))...)
 			continue
 		}
 		disruptionBudgetMapping[candidate.NodePool.Name]--
+		nodePoolCandidateMapping[candidate.NodePool.Name]++
 		cmds = append(cmds, Command{
 			Candidates:   []*Candidate{candidate},
 			Replacements: replacementsFromNodeClaims(results.NewNodeClaims...),
