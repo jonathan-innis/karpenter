@@ -411,4 +411,5 @@ var _ = Describe("Termination", func() {
 		ExpectExists(ctx, env.Client, node)
 		ExpectNotFound(ctx, env.Client, nodeClaim)
 	})
+	// TODO: Add the TerminationUtil testing in here so that we hold the same bar for Termination status condition
 })

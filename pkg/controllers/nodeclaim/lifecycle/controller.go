@@ -35,8 +35,10 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	terminatorevents "sigs.k8s.io/karpenter/pkg/controllers/node/termination/terminator/events"
@@ -59,10 +61,118 @@ type Controller struct {
 	cloudProvider cloudprovider.CloudProvider
 	recorder      events.Recorder
 
-	launch         *Launch
 	registration   *Registration
 	initialization *Initialization
 	liveness       *Liveness
+}
+
+type LaunchController struct {
+	kubeClient    client.Client
+	cloudProvider cloudprovider.CloudProvider
+	recorder      events.Recorder
+
+	launch *Launch
+}
+
+func NewLaunchController(kubeClient client.Client, cloudProvider cloudprovider.CloudProvider, recorder events.Recorder) *LaunchController {
+	return &LaunchController{
+		kubeClient:    kubeClient,
+		cloudProvider: cloudProvider,
+		recorder:      recorder,
+
+		launch: &Launch{kubeClient: kubeClient, cloudProvider: cloudProvider, cache: cache.New(time.Hour, time.Minute), recorder: recorder},
+	}
+}
+
+func (c *LaunchController) Register(_ context.Context, m manager.Manager) error {
+	return controllerruntime.NewControllerManagedBy(m).
+		Named(c.Name()).
+		For(&v1.NodeClaim{}, builder.WithPredicates(nodeclaimutils.IsManagedPredicateFuncs(c.cloudProvider))).
+		Watches(
+			&corev1.Node{},
+			nodeclaimutils.NodeEventHandler(c.kubeClient, c.cloudProvider),
+			builder.WithPredicates(predicate.Funcs{
+				CreateFunc: func(event.TypedCreateEvent[client.Object]) bool {
+					return false
+				},
+				UpdateFunc: func(event.TypedUpdateEvent[client.Object]) bool {
+					return false
+				},
+			}),
+		).
+		WithOptions(controller.Options{
+			RateLimiter:             workqueue.NewTypedItemExponentialFailureRateLimiter[reconcile.Request](time.Second, time.Second*10),
+			MaxConcurrentReconciles: 5000, // higher concurrency limit since we want fast reaction to node syncing and launch
+		}).
+		Complete(reconcile.AsReconciler(m.GetClient(), c))
+}
+
+func (c *LaunchController) Name() string {
+	return "nodeclaim.launch.lifecycle"
+}
+
+// nolint:gocyclo
+func (c *LaunchController) Reconcile(ctx context.Context, nodeClaim *v1.NodeClaim) (reconcile.Result, error) {
+	ctx = injection.WithControllerName(ctx, c.Name())
+	if nodeClaim.Status.ProviderID != "" {
+		ctx = log.IntoContext(ctx, log.FromContext(ctx).WithValues("provider-id", nodeClaim.Status.ProviderID))
+	}
+	if nodeClaim.Status.NodeName != "" {
+		ctx = log.IntoContext(ctx, log.FromContext(ctx).WithValues("Node", klog.KRef("", nodeClaim.Status.NodeName)))
+	}
+	if !nodeclaimutils.IsManaged(nodeClaim, c.cloudProvider) {
+		return reconcile.Result{}, nil
+	}
+	if !nodeClaim.DeletionTimestamp.IsZero() {
+		return c.finalize(ctx, nodeClaim)
+	}
+	if nodeClaim.StatusConditions().Get(v1.ConditionTypeLaunched).IsTrue() {
+		return reconcile.Result{}, nil
+	}
+
+	// Add the finalizer immediately since we shouldn't launch if we don't yet have the finalizer.
+	// Otherwise, we could leak resources
+	stored := nodeClaim.DeepCopy()
+	controllerutil.AddFinalizer(nodeClaim, v1.TerminationFinalizer)
+	if !equality.Semantic.DeepEqual(nodeClaim, stored) {
+		// We use client.MergeFromWithOptimisticLock because patching a list with a JSON merge patch
+		// can cause races due to the fact that it fully replaces the list on a change
+		// Here, we are updating the finalizer list
+		if err := c.kubeClient.Patch(ctx, nodeClaim, client.MergeFromWithOptions(stored, client.MergeFromWithOptimisticLock{})); err != nil {
+			if errors.IsConflict(err) {
+				return reconcile.Result{Requeue: true}, nil
+			}
+			return reconcile.Result{}, client.IgnoreNotFound(err)
+		}
+	}
+
+	stored = nodeClaim.DeepCopy()
+	var results []reconcile.Result
+	var errs error
+	for _, reconciler := range []reconcile.TypedReconciler[*v1.NodeClaim]{
+		c.launch,
+	} {
+		res, err := reconciler.Reconcile(ctx, nodeClaim)
+		errs = multierr.Append(errs, err)
+		results = append(results, res)
+	}
+	if !equality.Semantic.DeepEqual(stored, nodeClaim) {
+		statusCopy := nodeClaim.DeepCopy()
+		if err := c.kubeClient.Patch(ctx, nodeClaim, client.MergeFrom(stored)); err != nil {
+			return reconcile.Result{}, client.IgnoreNotFound(multierr.Append(errs, err))
+		}
+		if err := c.kubeClient.Status().Patch(ctx, statusCopy, client.MergeFrom(stored)); err != nil {
+			return reconcile.Result{}, client.IgnoreNotFound(multierr.Append(errs, err))
+		}
+		// We sleep here after a patch operation since we want to ensure that we are able to read our own writes
+		// so that we avoid duplicating metrics and log lines due to quick re-queues from our node watcher
+		// USE CAUTION when determining whether to increase this timeout or remove this line
+		time.Sleep(time.Second)
+	}
+	if errs != nil {
+		return reconcile.Result{}, errs
+	}
+	return result.Min(results...), nil
 }
 
 func NewController(clk clock.Clock, kubeClient client.Client, cloudProvider cloudprovider.CloudProvider, recorder events.Recorder) *Controller {
@@ -71,7 +181,6 @@ func NewController(clk clock.Clock, kubeClient client.Client, cloudProvider clou
 		cloudProvider: cloudProvider,
 		recorder:      recorder,
 
-		launch:         &Launch{kubeClient: kubeClient, cloudProvider: cloudProvider, cache: cache.New(time.Hour, time.Minute), recorder: recorder},
 		registration:   &Registration{kubeClient: kubeClient, recorder: recorder},
 		initialization: &Initialization{kubeClient: kubeClient},
 		liveness:       &Liveness{clock: clk, kubeClient: kubeClient},
@@ -110,30 +219,13 @@ func (c *Controller) Reconcile(ctx context.Context, nodeClaim *v1.NodeClaim) (re
 		return reconcile.Result{}, nil
 	}
 	if !nodeClaim.DeletionTimestamp.IsZero() {
-		return c.finalize(ctx, nodeClaim)
+		return reconcile.Result{}, nil
 	}
 
-	// Add the finalizer immediately since we shouldn't launch if we don't yet have the finalizer.
-	// Otherwise, we could leak resources
 	stored := nodeClaim.DeepCopy()
-	controllerutil.AddFinalizer(nodeClaim, v1.TerminationFinalizer)
-	if !equality.Semantic.DeepEqual(nodeClaim, stored) {
-		// We use client.MergeFromWithOptimisticLock because patching a list with a JSON merge patch
-		// can cause races due to the fact that it fully replaces the list on a change
-		// Here, we are updating the finalizer list
-		if err := c.kubeClient.Patch(ctx, nodeClaim, client.MergeFromWithOptions(stored, client.MergeFromWithOptimisticLock{})); err != nil {
-			if errors.IsConflict(err) {
-				return reconcile.Result{Requeue: true}, nil
-			}
-			return reconcile.Result{}, client.IgnoreNotFound(err)
-		}
-	}
-
-	stored = nodeClaim.DeepCopy()
 	var results []reconcile.Result
 	var errs error
 	for _, reconciler := range []reconcile.TypedReconciler[*v1.NodeClaim]{
-		c.launch,
 		c.registration,
 		c.initialization,
 		c.liveness,
@@ -143,12 +235,7 @@ func (c *Controller) Reconcile(ctx context.Context, nodeClaim *v1.NodeClaim) (re
 		results = append(results, res)
 	}
 	if !equality.Semantic.DeepEqual(stored, nodeClaim) {
-		statusCopy := nodeClaim.DeepCopy()
-		if err := c.kubeClient.Patch(ctx, nodeClaim, client.MergeFrom(stored)); err != nil {
-			return reconcile.Result{}, client.IgnoreNotFound(multierr.Append(errs, err))
-		}
-
-		if err := c.kubeClient.Status().Patch(ctx, statusCopy, client.MergeFrom(stored)); err != nil {
+		if err := c.kubeClient.Status().Patch(ctx, nodeClaim, client.MergeFrom(stored)); err != nil {
 			return reconcile.Result{}, client.IgnoreNotFound(multierr.Append(errs, err))
 		}
 		// We sleep here after a patch operation since we want to ensure that we are able to read our own writes
@@ -163,7 +250,7 @@ func (c *Controller) Reconcile(ctx context.Context, nodeClaim *v1.NodeClaim) (re
 }
 
 //nolint:gocyclo
-func (c *Controller) finalize(ctx context.Context, nodeClaim *v1.NodeClaim) (reconcile.Result, error) {
+func (c *LaunchController) finalize(ctx context.Context, nodeClaim *v1.NodeClaim) (reconcile.Result, error) {
 	if !controllerutil.ContainsFinalizer(nodeClaim, v1.TerminationFinalizer) {
 		return reconcile.Result{}, nil
 	}
@@ -253,7 +340,7 @@ func (c *Controller) finalize(ctx context.Context, nodeClaim *v1.NodeClaim) (rec
 
 }
 
-func (c *Controller) ensureTerminationGracePeriodTerminationTimeAnnotation(ctx context.Context, nodeClaim *v1.NodeClaim) error {
+func (c *LaunchController) ensureTerminationGracePeriodTerminationTimeAnnotation(ctx context.Context, nodeClaim *v1.NodeClaim) error {
 	// if the expiration annotation is already set, we don't need to do anything
 	if _, exists := nodeClaim.ObjectMeta.Annotations[v1.NodeClaimTerminationTimestampAnnotationKey]; exists {
 		return nil
@@ -270,7 +357,7 @@ func (c *Controller) ensureTerminationGracePeriodTerminationTimeAnnotation(ctx c
 	return nil
 }
 
-func (c *Controller) annotateTerminationGracePeriodTerminationTime(ctx context.Context, nodeClaim *v1.NodeClaim, terminationTime string) error {
+func (c *LaunchController) annotateTerminationGracePeriodTerminationTime(ctx context.Context, nodeClaim *v1.NodeClaim, terminationTime string) error {
 	stored := nodeClaim.DeepCopy()
 	nodeClaim.ObjectMeta.Annotations = lo.Assign(nodeClaim.ObjectMeta.Annotations, map[string]string{v1.NodeClaimTerminationTimestampAnnotationKey: terminationTime})
 

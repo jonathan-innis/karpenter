@@ -31,7 +31,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	clock "k8s.io/utils/clock/testing"
 	"sigs.k8s.io/controller-runtime/pkg/log"
-
 	"sigs.k8s.io/karpenter/pkg/operator/logging"
 
 	"sigs.k8s.io/karpenter/pkg/apis"
