@@ -175,6 +175,9 @@ func (c Command) LogValues() []any {
 			"capacity-type": candidate.Labels()[v1.CapacityTypeLabelKey],
 		}
 	})
+	if len(candidateNodes) > 20 {
+		candidateNodes = append(candidateNodes[:20], fmt.Sprintf("and %d others", len(candidateNodes)-20))
+	}
 	replacementNodes := lo.Map(c.Replacements, func(replacement *Replacement, _ int) interface{} {
 		ct := replacement.Requirements.Get(v1.CapacityTypeLabelKey)
 		m := map[string]interface{}{
@@ -189,13 +192,16 @@ func (c Command) LogValues() []any {
 		}
 		return m
 	})
+	if len(replacementNodes) > 20 {
+		replacementNodes = append(replacementNodes[:20], fmt.Sprintf("and %d others", len(replacementNodes)-20))
+	}
 
 	return []any{
 		"decision", c.Decision(),
 		"disrupted-node-count", len(candidateNodes),
 		"replacement-node-count", len(replacementNodes),
 		"pod-count", podCount,
-		"disrupted-nodes", pretty.Slice(lo.Map(candidateNodes, func(i interface{}, _ int) string { return pretty.Concise(i) }), 20),
-		"replacement-nodes", pretty.Slice(lo.Map(replacementNodes, func(i interface{}, _ int) string { return pretty.Concise(i) }), 20),
+		"disrupted-nodes", candidateNodes,
+		"replacement-nodes", replacementNodes,
 	}
 }

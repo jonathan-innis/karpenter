@@ -25,7 +25,6 @@ import (
 
 	"github.com/awslabs/operatorpkg/serrors"
 	"github.com/samber/lo"
-	"golang.org/x/time/rate"
 	corev1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -121,7 +120,6 @@ func (q *Queue) Register(_ context.Context, m manager.Manager) error {
 		WithOptions(controller.Options{
 			RateLimiter: workqueue.NewTypedMaxOfRateLimiter[reconcile.Request](
 				workqueue.NewTypedItemExponentialFailureRateLimiter[reconcile.Request](evictionQueueBaseDelay, evictionQueueMaxDelay),
-				&workqueue.TypedBucketRateLimiter[reconcile.Request]{Limiter: rate.NewLimiter(rate.Limit(100), 1000)},
 			),
 			MaxConcurrentReconciles: 5000,
 		}).
