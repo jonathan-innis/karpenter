@@ -150,7 +150,7 @@ func (c *Controller) finalize(ctx context.Context, node *corev1.Node) (reconcile
 		// can cause races due to the fact that it fully replaces the list on a change
 		// Here, we are updating the status condition list
 		if patchErr := c.kubeClient.Status().Patch(ctx, nodeClaim, client.MergeFromWithOptions(stored, client.MergeFromWithOptimisticLock{})); client.IgnoreNotFound(patchErr) != nil {
-			if errors.IsConflict(err) {
+			if errors.IsConflict(patchErr) {
 				return reconcile.Result{Requeue: true}, nil
 			}
 			return reconcile.Result{}, fmt.Errorf("updating nodeclaim, %w", err)
