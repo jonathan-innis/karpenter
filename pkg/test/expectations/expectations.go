@@ -32,6 +32,7 @@ import (
 	"github.com/awslabs/operatorpkg/status"
 	. "github.com/onsi/ginkgo/v2" //nolint:revive,stylecheck
 	. "github.com/onsi/gomega"    //nolint:revive,stylecheck
+	gomegatypes "github.com/onsi/gomega/types"
 	"github.com/prometheus/client_golang/prometheus"
 	prometheusmodel "github.com/prometheus/client_model/go"
 	"github.com/samber/lo"
@@ -53,6 +54,8 @@ import (
 	crmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
+	pscheduling "sigs.k8s.io/karpenter/pkg/scheduling"
+
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/apis/v1alpha1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
@@ -62,7 +65,6 @@ import (
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/controllers/state/informer"
 	"sigs.k8s.io/karpenter/pkg/metrics"
-	pscheduling "sigs.k8s.io/karpenter/pkg/scheduling"
 	"sigs.k8s.io/karpenter/pkg/test"
 	testv1alpha1 "sigs.k8s.io/karpenter/pkg/test/v1alpha1"
 )
@@ -139,34 +141,45 @@ func ExpectNotScheduled(ctx context.Context, c client.Client, pod *corev1.Pod) *
 
 func ExpectApplied(ctx context.Context, c client.Client, objects ...client.Object) {
 	GinkgoHelper()
-	for _, object := range objects {
-		deletionTimestampSet := !object.GetDeletionTimestamp().IsZero()
-		current := object.DeepCopyObject().(client.Object)
-		statuscopy := object.DeepCopyObject().(client.Object) // Snapshot the status, since create/update may override
+	for _, o := range objects {
+		current := o.DeepCopyObject().(client.Object)
 
 		// Create or Update
 		if err := c.Get(ctx, client.ObjectKeyFromObject(current), current); err != nil {
 			if errors.IsNotFound(err) {
-				Expect(c.Create(ctx, object)).To(Succeed())
+				Expect(c.Create(ctx, o)).To(Succeed())
 			} else {
 				Expect(err).ToNot(HaveOccurred())
 			}
 		} else {
-			object.SetResourceVersion(current.GetResourceVersion())
-			Expect(c.Update(ctx, object)).To(Succeed())
+			Expect(c.Patch(ctx, o, client.MergeFrom(current))).To(Succeed())
 		}
-		// Update status
-		statuscopy.SetResourceVersion(object.GetResourceVersion())
-		Expect(c.Status().Update(ctx, statuscopy)).To(Or(Succeed(), MatchError("the server could not find the requested resource"))) // Some objects do not have a status
-
 		// Re-get the object to grab the updated spec and status
-		Expect(c.Get(ctx, client.ObjectKeyFromObject(object), object)).To(Succeed())
-
-		// Set the deletion timestamp by adding a finalizer and deleting
-		if deletionTimestampSet {
-			ExpectDeletionTimestampSet(ctx, c, object)
-		}
+		ExpectObject(ctx, c, o)
 	}
+}
+
+func ExpectStatusUpdated(ctx context.Context, c client.Client, objects ...client.Object) {
+	GinkgoHelper()
+	for _, o := range objects {
+		// Previous implementations attempted the following:
+		// 1. Using merge patch, instead
+		// 2. Including this logic in ExpectApplied to simplify test code
+		// The former doesn't work, as merge patches cannot reset
+		// primitives like strings and integers to "" or 0, and CRDs
+		// don't support strategic merge patch. The latter doesn't work
+		// since status must be updated in another call, which can cause
+		// optimistic locking issues if other threads are updating objects
+		// e.g. pod statuses being updated during integration tests.
+		Expect(c.Status().Update(ctx, o.DeepCopyObject().(client.Object))).To(Succeed())
+		ExpectObject(ctx, c, o)
+	}
+}
+
+func ExpectObject[T client.Object](ctx context.Context, c client.Client, obj T) gomegatypes.Assertion {
+	GinkgoHelper()
+	Expect(c.Get(ctx, client.ObjectKeyFromObject(obj), obj)).To(Succeed())
+	return Expect(obj)
 }
 
 func ExpectDeleted(ctx context.Context, c client.Client, objects ...client.Object) {
@@ -371,8 +384,11 @@ func ExpectNodeClaimDeployedNoNode(ctx context.Context, c client.Client, cloudPr
 
 	// Make the nodeclaim ready in the status conditions
 	nc = lifecycle.PopulateNodeClaimDetails(nc, resolved)
-	nc.StatusConditions().SetTrue(v1.ConditionTypeLaunched)
+	statusCopy := nc.DeepCopy()
 	ExpectApplied(ctx, c, nc)
+	nc.Status = statusCopy.Status
+	nc.StatusConditions().SetTrue(v1.ConditionTypeLaunched)
+	ExpectStatusUpdated(ctx, c, nc)
 	return nc, nil
 }
 
@@ -384,12 +400,13 @@ func ExpectNodeClaimDeployed(ctx context.Context, c client.Client, cloudProvider
 		return nc, nil, err
 	}
 	nc.StatusConditions().SetTrue(v1.ConditionTypeRegistered)
+	ExpectStatusUpdated(ctx, c, nc)
 
 	// Mock the nodeclaim launch and node joining at the apiserver
 	node := test.NodeClaimLinkedNode(nc)
 	node.Spec.Taints = lo.Reject(node.Spec.Taints, func(t corev1.Taint, _ int) bool { return t.MatchTaint(&v1.UnregisteredNoExecuteTaint) })
 	node.Labels = lo.Assign(node.Labels, map[string]string{v1.NodeRegisteredLabelKey: "true"})
-	ExpectApplied(ctx, c, nc, node)
+	ExpectApplied(ctx, c, node)
 	return nc, node, nil
 }
 
@@ -459,16 +476,21 @@ func ExpectMakeNodesNotReady(ctx context.Context, c client.Client, nodes ...*cor
 				Reason:             "NotReady",
 			},
 		}
-		if nodes[i].Labels == nil {
-			nodes[i].Labels = map[string]string{}
-		}
-		ExpectApplied(ctx, c, nodes[i])
+		ExpectStatusUpdated(ctx, c, nodes[i])
 	}
 }
 
 func ExpectMakeNodesReady(ctx context.Context, c client.Client, nodes ...*corev1.Node) {
 	for i := range nodes {
 		nodes[i] = ExpectExists(ctx, c, nodes[i])
+		// Remove any of the known ephemeral taints to make the Node ready
+		nodes[i].Spec.Taints = lo.Reject(nodes[i].Spec.Taints, func(taint corev1.Taint, _ int) bool {
+			_, found := lo.Find(pscheduling.KnownEphemeralTaints, func(t corev1.Taint) bool {
+				return t.MatchTaint(&taint)
+			})
+			return found
+		})
+		ExpectApplied(ctx, c, nodes[i])
 		nodes[i].Status.Phase = corev1.NodeRunning
 		nodes[i].Status.Conditions = []corev1.NodeCondition{
 			{
@@ -479,17 +501,7 @@ func ExpectMakeNodesReady(ctx context.Context, c client.Client, nodes ...*corev1
 				Reason:             "KubeletReady",
 			},
 		}
-		if nodes[i].Labels == nil {
-			nodes[i].Labels = map[string]string{}
-		}
-		// Remove any of the known ephemeral taints to make the Node ready
-		nodes[i].Spec.Taints = lo.Reject(nodes[i].Spec.Taints, func(taint corev1.Taint, _ int) bool {
-			_, found := lo.Find(pscheduling.KnownEphemeralTaints, func(t corev1.Taint) bool {
-				return t.MatchTaint(&taint)
-			})
-			return found
-		})
-		ExpectApplied(ctx, c, nodes[i])
+		ExpectStatusUpdated(ctx, c, nodes[i])
 	}
 }
 
