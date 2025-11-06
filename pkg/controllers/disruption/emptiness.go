@@ -21,10 +21,13 @@ import (
 	"fmt"
 
 	"github.com/awslabs/operatorpkg/option"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	disruptionevents "sigs.k8s.io/karpenter/pkg/controllers/disruption/events"
+	"sigs.k8s.io/karpenter/pkg/operator/tracing"
 )
 
 // Emptiness is a subreconciler that deletes empty candidates.
@@ -39,12 +42,20 @@ func NewEmptiness(c consolidation, opts ...option.Function[MethodOptions]) *Empt
 }
 
 // ShouldDisrupt is a predicate used to filter candidates
-func (e *Emptiness) ShouldDisrupt(_ context.Context, c *Candidate) bool {
+func (e *Emptiness) ShouldDisrupt(ctx context.Context, c *Candidate) bool {
+	ctx = tracing.StartSpan(ctx, "ShouldDisrupt", trace.WithAttributes(
+		attribute.String("candidate.node", c.Node.Name),
+		attribute.String("candidate.nodeclaim", c.NodeClaim.Name),
+		attribute.String("candidate.nodepool", c.NodePool.Name)),
+	)
+
 	if c.OwnedByStaticNodePool() {
+		tracing.EndSpan(ctx, fmt.Errorf("candidate is owned by a static nodepool"))
 		return false
 	}
 	// If consolidation is disabled, don't do anything. This emptiness should run for both WhenEmpty and WhenEmptyOrUnderutilized
 	if c.NodePool.Spec.Disruption.ConsolidateAfter.Duration == nil {
+		tracing.EndSpan(ctx, fmt.Errorf("candidate is not consolidatable because nodepool %q has consolidation disabled", c.NodePool.Name))
 		e.recorder.Publish(disruptionevents.Unconsolidatable(c.Node, c.NodeClaim, fmt.Sprintf("NodePool %q has consolidation disabled", c.NodePool.Name))...)
 		return false
 	}
@@ -59,14 +70,27 @@ func (e *Emptiness) ShouldDisrupt(_ context.Context, c *Candidate) bool {
 		return false
 	}
 	// return true if there are no pods and the nodeclaim is consolidatable
-	return len(c.reschedulablePods) == 0 && c.NodeClaim.StatusConditions().Get(v1.ConditionTypeConsolidatable).IsTrue()
+	if len(c.reschedulablePods) != 0 {
+		tracing.EndSpan(ctx, fmt.Errorf("candidate has reschedulable pods"))
+		return false
+	}
+	if !c.NodeClaim.StatusConditions().Get(v1.ConditionTypeConsolidatable).IsTrue() {
+		tracing.EndSpan(ctx, fmt.Errorf("candidate does not have the consolidatable condition"))
+		return false
+	}
+	tracing.EndSpan(ctx, nil)
+	return true
 }
 
 // ComputeCommand generates a disruption command given candidates
 //
 //nolint:gocyclo
-func (e *Emptiness) ComputeCommands(ctx context.Context, disruptionBudgetMapping map[string]int, candidates ...*Candidate) ([]Command, error) {
+func (e *Emptiness) ComputeCommands(ctx context.Context, disruptionBudgetMapping map[string]int, candidates ...*Candidate) (cmds []Command, err error) {
+	ctx = tracing.StartSpan(ctx, "ComputeCommands", trace.WithAttributes(attribute.Int("candidates.count", len(candidates))))
+	defer tracing.EndSpan(ctx, err)
+
 	if e.IsConsolidated() {
+		tracing.SpanFromContext(ctx).AddEvent("cluster has been recently consolidated so exiting early")
 		return []Command{}, nil
 	}
 	candidates = e.sortCandidates(candidates)
@@ -74,21 +98,37 @@ func (e *Emptiness) ComputeCommands(ctx context.Context, disruptionBudgetMapping
 	empty := make([]*Candidate, 0, len(candidates))
 	constrainedByBudgets := false
 	for _, candidate := range candidates {
+		candidateCtx := tracing.StartSpan(ctx, "ComputeCommands.filterCandidates", trace.WithAttributes(
+			attribute.String("candidate.node", candidate.Node.Name),
+			attribute.String("candidate.nodeclaim", candidate.NodeClaim.Name),
+			attribute.String("candidate.nodepool", candidate.NodePool.Name),
+			attribute.Int("candidate.reschedulablePods", len(candidate.reschedulablePods)),
+			attribute.Int("candidate.remainingBudget", disruptionBudgetMapping[candidate.NodePool.Name])),
+		)
 		if len(candidate.reschedulablePods) > 0 {
+			tracing.SpanFromContext(candidateCtx).AddEvent("candidate has reschedulable pods")
+			tracing.EndSpan(candidateCtx, nil)
 			continue
 		}
 		if disruptionBudgetMapping[candidate.NodePool.Name] == 0 {
 			// set constrainedByBudgets to true if any node was a candidate but was constrained by a budget
 			constrainedByBudgets = true
+			tracing.SpanFromContext(candidateCtx).AddEvent("candidate is constrained by budgets")
+			tracing.EndSpan(candidateCtx, nil)
 			continue
 		}
 		// If there's disruptions allowed for the candidate's nodepool,
 		// add it to the list of candidates, and decrement the budget.
 		empty = append(empty, candidate)
 		disruptionBudgetMapping[candidate.NodePool.Name]--
+		tracing.EndSpan(candidateCtx, nil)
 	}
 	// none empty, so do nothing
+	tracing.SpanFromContext(ctx).SetAttributes(attribute.Bool("constrainedByBudgets", constrainedByBudgets))
 	if len(empty) == 0 {
+		tracing.SpanFromContext(ctx).SetAttributes(attribute.Int("candidates.empty.count", len(empty)))
+		tracing.SpanFromContext(ctx).AddEvent("no empty candidates found")
+
 		// if there are no candidates, but a nodepool had a fully blocking budget,
 		// don't mark the cluster as consolidated, as it's possible this nodepool
 		// should be consolidated the next time we try to disrupt.
@@ -104,11 +144,16 @@ func (e *Emptiness) ComputeCommands(ctx context.Context, disruptionBudgetMapping
 	validCmd, err := e.validator.Validate(ctx, cmd, commandValidationDelay)
 	if err != nil {
 		if IsValidationError(err) {
+			tracing.SpanFromContext(ctx).AddEvent(fmt.Sprintf("abandoning empty node consolidation attempt due to pod churn, command is no longer valid, %s", err))
 			log.FromContext(ctx).V(1).WithValues(cmd.LogValues()...).Info("abandoning empty node consolidation attempt due to pod churn, command is no longer valid")
 			return []Command{}, nil
 		}
 		return []Command{}, err
 	}
+	tracing.SpanFromContext(ctx).AddEvent("found valid empty node consolidation command", trace.WithAttributes(
+		attribute.Int("candidates.count", len(validCmd.Candidates)),
+		attribute.Int("replacements.count", len(validCmd.Replacements))),
+	)
 	return []Command{validCmd}, nil
 }
 

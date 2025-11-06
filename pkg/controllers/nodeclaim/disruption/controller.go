@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/patrickmn/go-cache"
+	"go.opentelemetry.io/otel/attribute"
 	"go.uber.org/multierr"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
@@ -39,6 +40,7 @@ import (
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/operator/injection"
+	"sigs.k8s.io/karpenter/pkg/operator/tracing"
 	utilscontroller "sigs.k8s.io/karpenter/pkg/utils/controller"
 	nodeclaimutils "sigs.k8s.io/karpenter/pkg/utils/nodeclaim"
 	"sigs.k8s.io/karpenter/pkg/utils/result"
@@ -76,13 +78,28 @@ func (c *Controller) Name() string {
 
 func (c *Controller) Reconcile(ctx context.Context, nodeClaim *v1.NodeClaim) (reconcile.Result, error) {
 	ctx = injection.WithControllerName(ctx, c.Name())
+
+	tracing.SpanFromContext(ctx).SetAttributes(
+		attribute.String("nodeclaim.name", nodeClaim.Name),
+		attribute.String("nodeclaim.namespace", nodeClaim.Namespace),
+	)
+
 	if nodeClaim.Status.NodeName != "" {
+		tracing.SpanFromContext(ctx).SetAttributes(attribute.String("nodeclaim.node_name", nodeClaim.Status.NodeName))
 		ctx = log.IntoContext(ctx, log.FromContext(ctx).WithValues("Node", klog.KRef("", nodeClaim.Status.NodeName)))
 	}
 
 	if !nodeclaimutils.IsManaged(nodeClaim, c.cloudProvider) || !nodeClaim.DeletionTimestamp.IsZero() {
+		tracing.SpanFromContext(ctx).SetAttributes(
+			attribute.Bool("nodeclaim.managed", nodeclaimutils.IsManaged(nodeClaim, c.cloudProvider)),
+			attribute.Bool("nodeclaim.deleting", !nodeClaim.DeletionTimestamp.IsZero()),
+		)
 		return reconcile.Result{}, nil
 	}
+	tracing.SpanFromContext(ctx).SetAttributes(
+		attribute.Bool("nodeclaim.managed", true),
+		attribute.Bool("nodeclaim.deleting", false),
+	)
 
 	stored := nodeClaim.DeepCopy()
 	nodePoolName, ok := nodeClaim.Labels[v1.NodePoolLabelKey]
@@ -122,7 +139,7 @@ func (c *Controller) Register(ctx context.Context, m manager.Manager) error {
 	for _, nodeClass := range c.cloudProvider.GetSupportedNodeClasses() {
 		b.Watches(nodeClass, nodeclaimutils.NodeClassEventHandler(c.kubeClient))
 	}
-	return b.Complete(reconcile.AsReconciler(m.GetClient(), c))
+	return b.Complete(tracing.WithObjectTracing[*v1.NodeClaim](reconcile.AsReconciler(m.GetClient(), c), c.Name()))
 }
 
 func (c *Controller) Reset() {

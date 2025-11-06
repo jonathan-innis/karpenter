@@ -24,6 +24,7 @@ import (
 
 	"github.com/awslabs/operatorpkg/singleton"
 	"github.com/samber/lo"
+	"go.opentelemetry.io/otel/attribute"
 	"go.uber.org/multierr"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/sets"
@@ -39,6 +40,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/metrics"
 	"sigs.k8s.io/karpenter/pkg/operator/injection"
+	"sigs.k8s.io/karpenter/pkg/operator/tracing"
 	nodeutils "sigs.k8s.io/karpenter/pkg/utils/node"
 	nodeclaimutils "sigs.k8s.io/karpenter/pkg/utils/nodeclaim"
 )
@@ -68,10 +70,13 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 	if err != nil {
 		return reconciler.Result{}, err
 	}
+	tracing.SpanFromContext(ctx).SetAttributes(attribute.Int("nodeclaims.total", len(nodeClaims)))
+
 	cloudProviderNodeClaims, err := c.cloudProvider.List(ctx)
 	if err != nil {
 		return reconciler.Result{}, err
 	}
+	tracing.SpanFromContext(ctx).SetAttributes(attribute.Int("nodeclaims.cloud_provider", len(cloudProviderNodeClaims)))
 	cloudProviderNodeClaims = lo.Filter(cloudProviderNodeClaims, func(nc *v1.NodeClaim, _ int) bool {
 		return nc.DeletionTimestamp.IsZero()
 	})
@@ -118,6 +123,7 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 	if err = multierr.Combine(errs...); err != nil {
 		return reconciler.Result{}, err
 	}
+	tracing.SpanFromContext(ctx).SetAttributes(attribute.Int("nodeclaims.garbage_collected", len(nodeClaims)))
 	return reconciler.Result{RequeueAfter: time.Minute * 2}, nil
 }
 
@@ -125,5 +131,5 @@ func (c *Controller) Register(_ context.Context, m manager.Manager) error {
 	return controllerruntime.NewControllerManagedBy(m).
 		Named(c.Name()).
 		WatchesRawSource(singleton.Source()).
-		Complete(singleton.AsReconciler(c))
+		Complete(tracing.WithObjectTracing[*v1.NodeClaim](singleton.AsReconciler(c), c.Name()))
 }

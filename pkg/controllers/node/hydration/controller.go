@@ -39,6 +39,8 @@ import (
 	utilscontroller "sigs.k8s.io/karpenter/pkg/utils/controller"
 	nodeutils "sigs.k8s.io/karpenter/pkg/utils/node"
 	nodeclaimutils "sigs.k8s.io/karpenter/pkg/utils/nodeclaim"
+
+	"sigs.k8s.io/karpenter/pkg/operator/tracing"
 )
 
 // Controller hydrates information to the Node which is expected in newer versions of Karpenter, but would not exist on
@@ -95,5 +97,5 @@ func (c *Controller) Register(ctx context.Context, m manager.Manager) error {
 			RateLimiter:             reasonable.RateLimiter(),
 			MaxConcurrentReconciles: utilscontroller.LinearScaleReconciles(utilscontroller.CPUCount(ctx), 1000, 5000),
 		}).
-		Complete(reconcile.AsReconciler(m.GetClient(), c))
+		Complete(tracing.WithObjectTracing[*corev1.Node](reconcile.AsReconciler(m.GetClient(), c), c.Name()))
 }

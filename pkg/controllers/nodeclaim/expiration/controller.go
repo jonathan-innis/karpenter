@@ -21,6 +21,7 @@ import (
 	"strings"
 	"time"
 
+	"go.opentelemetry.io/otel/attribute"
 	"k8s.io/klog/v2"
 	"k8s.io/utils/clock"
 	controllerruntime "sigs.k8s.io/controller-runtime"
@@ -31,6 +32,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	"sigs.k8s.io/karpenter/pkg/operator/injection"
+	"sigs.k8s.io/karpenter/pkg/operator/tracing"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
@@ -56,14 +58,24 @@ func NewController(clk clock.Clock, kubeClient client.Client, cloudProvider clou
 
 func (c *Controller) Reconcile(ctx context.Context, nodeClaim *v1.NodeClaim) (reconcile.Result, error) {
 	ctx = injection.WithControllerName(ctx, c.Name())
+
+	tracing.SpanFromContext(ctx).SetAttributes(
+		attribute.String("nodeclaim.name", nodeClaim.Name),
+		attribute.String("nodeclaim.namespace", nodeClaim.Namespace),
+	)
+
 	if nodeClaim.Status.NodeName != "" {
+		tracing.SpanFromContext(ctx).SetAttributes(attribute.String("nodeclaim.node_name", nodeClaim.Status.NodeName))
 		ctx = log.IntoContext(ctx, log.FromContext(ctx).WithValues("Node", klog.KRef("", nodeClaim.Status.NodeName)))
 	}
 
 	if !nodeclaimutils.IsManaged(nodeClaim, c.cloudProvider) {
+		tracing.SpanFromContext(ctx).SetAttributes(attribute.Bool("nodeclaim.managed", false))
 		return reconcile.Result{}, nil
 	}
+	tracing.SpanFromContext(ctx).SetAttributes(attribute.Bool("nodeclaim.managed", true))
 	if !nodeClaim.DeletionTimestamp.IsZero() {
+		tracing.SpanFromContext(ctx).SetAttributes(attribute.Bool("nodeclaim.deleting", true))
 		return reconcile.Result{}, nil
 	}
 	// From here there are three scenarios to handle:
@@ -78,6 +90,7 @@ func (c *Controller) Reconcile(ctx context.Context, nodeClaim *v1.NodeClaim) (re
 		return reconcile.Result{RequeueAfter: expirationTime.Sub(c.clock.Now())}, nil
 	}
 	// 3. Otherwise, if the NodeClaim is expired we can forcefully expire the nodeclaim (by deleting it)
+	tracing.SpanFromContext(ctx).SetAttributes(attribute.Bool("nodeclaim.expired", true))
 	if err := c.kubeClient.Delete(ctx, nodeClaim); err != nil {
 		return reconcile.Result{}, client.IgnoreNotFound(err)
 	}
@@ -103,5 +116,5 @@ func (c *Controller) Register(_ context.Context, m manager.Manager) error {
 	return controllerruntime.NewControllerManagedBy(m).
 		Named(c.Name()).
 		For(&v1.NodeClaim{}, builder.WithPredicates(nodeclaimutils.IsManagedPredicateFuncs(c.cloudProvider))).
-		Complete(reconcile.AsReconciler(m.GetClient(), c))
+		Complete(tracing.WithObjectTracing[*v1.NodeClaim](reconcile.AsReconciler(m.GetClient(), c), c.Name()))
 }

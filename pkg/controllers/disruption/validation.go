@@ -23,6 +23,8 @@ import (
 	"time"
 
 	"github.com/samber/lo"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 	"k8s.io/utils/clock"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -32,6 +34,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/controllers/provisioning/scheduling"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/events"
+	"sigs.k8s.io/karpenter/pkg/operator/tracing"
 )
 
 type ValidationError struct {
@@ -131,7 +134,10 @@ func NewEmptinessValidator(c consolidation) *EmptinessValidator {
 	}
 }
 
-func (e *EmptinessValidator) Validate(ctx context.Context, cmd Command, validationPeriod time.Duration) (Command, error) {
+func (e *EmptinessValidator) Validate(ctx context.Context, cmd Command, validationPeriod time.Duration) (outCmd Command, err error) {
+	ctx = tracing.StartSpan(ctx, "Validate")
+	defer tracing.EndSpan(ctx, err)
+
 	if validationPeriod > 0 {
 		select {
 		case <-ctx.Done():
@@ -143,6 +149,7 @@ func (e *EmptinessValidator) Validate(ctx context.Context, cmd Command, validati
 	if err != nil {
 		return Command{}, err
 	}
+	tracing.SpanFromContext(ctx).AddEvent(fmt.Sprintf("successfully validated %d candidates out of %d", len(validatedCandidates), len(cmd.Candidates)))
 	cmd.Candidates = validatedCandidates
 	return cmd, nil
 }
@@ -189,14 +196,21 @@ func NewMultiConsolidationValidator(c consolidation) *ConsolidationValidator {
 	}
 }
 
-func (c *ConsolidationValidator) Validate(ctx context.Context, cmd Command, validationPeriod time.Duration) (Command, error) {
+func (c *ConsolidationValidator) Validate(ctx context.Context, cmd Command, validationPeriod time.Duration) (outCmd Command, err error) {
+	ctx = tracing.StartSpan(ctx, "Validate")
+	defer tracing.EndSpan(ctx, err)
+
 	if err := c.isValid(ctx, cmd, validationPeriod); err != nil {
 		return Command{}, err
 	}
+	tracing.SpanFromContext(ctx).AddEvent("successful validated command")
 	return cmd, nil
 }
 
-func (c *ConsolidationValidator) isValid(ctx context.Context, cmd Command, validationPeriod time.Duration) error {
+func (c *ConsolidationValidator) isValid(ctx context.Context, cmd Command, validationPeriod time.Duration) (err error) {
+	ctx = tracing.StartSpan(ctx, "isValid")
+	defer tracing.EndSpan(ctx, err)
+
 	if validationPeriod > 0 {
 		select {
 		case <-ctx.Done():
@@ -208,18 +222,24 @@ func (c *ConsolidationValidator) isValid(ctx context.Context, cmd Command, valid
 	if err != nil {
 		return err
 	}
+	tracing.SpanFromContext(ctx).AddEvent("successfully validated candidates")
 	if err := c.validateCommand(ctx, cmd, validatedCandidates); err != nil {
 		return err
 	}
+	tracing.SpanFromContext(ctx).AddEvent("successfully validated command")
 	// Revalidate candidates after validating the command. This mitigates the chance of a race condition outlined in
 	// the following GitHub issue: https://github.com/kubernetes-sigs/karpenter/issues/1167.
 	if _, err = c.validateCandidates(ctx, validatedCandidates...); err != nil {
 		return err
 	}
+	tracing.SpanFromContext(ctx).AddEvent("successfully re-validated candidates")
 	return nil
 }
 
 func (e *EmptinessValidator) validateCandidates(ctx context.Context, candidates ...*Candidate) ([]*Candidate, error) {
+	ctx = tracing.StartSpan(ctx, "validateCandidates")
+	defer tracing.EndSpan(ctx, nil)
+
 	// This GetCandidates call filters out nodes that were nominated
 	validatedCandidates, err := GetCandidates(ctx, e.cluster, e.kubeClient, e.recorder, e.clock, e.cloudProvider, e.filter, GracefulDisruptionClass, e.queue)
 	if err != nil {
@@ -227,6 +247,7 @@ func (e *EmptinessValidator) validateCandidates(ctx context.Context, candidates 
 	}
 	validatedCandidates = mapCandidates(candidates, validatedCandidates)
 	if len(validatedCandidates) == 0 {
+		tracing.SpanFromContext(ctx).AddEvent(fmt.Sprintf("%d candidates are no longer valid", len(candidates)))
 		FailedValidationsTotal.Add(float64(len(candidates)), map[string]string{ConsolidationTypeLabel: e.validationType})
 		return nil, NewChurnValidationError(fmt.Errorf("%d candidates are no longer valid", len(candidates)))
 	}
@@ -236,17 +257,27 @@ func (e *EmptinessValidator) validateCandidates(ctx context.Context, candidates 
 	}
 
 	if valid := lo.Filter(validatedCandidates, func(cn *Candidate, _ int) bool {
+		candidateCtx := tracing.StartSpan(ctx, "validateCandidates.filterCandidates", trace.WithAttributes(
+			attribute.String("candidate.node", cn.Node.Name),
+			attribute.String("candidate.nodeclaim", cn.NodeClaim.Name),
+			attribute.String("candidate.nodepool", cn.NodePool.Name)),
+		)
+
 		if e.cluster.IsNodeNominated(cn.ProviderID()) {
+			tracing.EndSpan(candidateCtx, fmt.Errorf("candidate was nominated during validation"))
 			FailedValidationsTotal.Inc(map[string]string{ConsolidationTypeLabel: e.validationType})
 			return false
 		}
 		if disruptionBudgetMapping[cn.NodePool.Name] == 0 {
+			tracing.EndSpan(candidateCtx, fmt.Errorf("candidate can no longer be disrupted without violating budgets"))
 			FailedValidationsTotal.Inc(map[string]string{ConsolidationTypeLabel: e.validationType})
 			return false
 		}
 		disruptionBudgetMapping[cn.NodePool.Name]--
+		tracing.EndSpan(candidateCtx, nil)
 		return true
 	}); len(valid) > 0 {
+		tracing.SpanFromContext(ctx).AddEvent(fmt.Sprintf("successfully validated %d candidates", len(valid)))
 		return valid, nil
 	}
 	return nil, NewBudgetValidationError(fmt.Errorf("%d candidates failed validation because it they were nominated for a pod or would violate disruption budgets", len(candidates)))
@@ -261,6 +292,9 @@ func (e *EmptinessValidator) validateCandidates(ctx context.Context, candidates 
 //
 // If these conditions are met for all candidates, ValidateCandidates returns a slice with the updated representations.
 func (c *ConsolidationValidator) validateCandidates(ctx context.Context, candidates ...*Candidate) ([]*Candidate, error) {
+	ctx = tracing.StartSpan(ctx, "validateCandidates")
+	defer tracing.EndSpan(ctx, nil)
+
 	// GracefulDisruptionClass is hardcoded here because ValidateCandidates is only used for consolidation disruption. All consolidation disruption is graceful disruption.
 	validatedCandidates, err := GetCandidates(ctx, c.cluster, c.kubeClient, c.recorder, c.clock, c.cloudProvider, c.filter, GracefulDisruptionClass, c.queue)
 	if err != nil {
@@ -269,6 +303,7 @@ func (c *ConsolidationValidator) validateCandidates(ctx context.Context, candida
 	validatedCandidates = mapCandidates(candidates, validatedCandidates)
 	// If we filtered out any candidates, return nil as some NodeClaims in the consolidation decision have changed.
 	if len(validatedCandidates) != len(candidates) {
+		tracing.SpanFromContext(ctx).AddEvent(fmt.Sprintf("%d candidates are no longer valid", len(candidates)-len(validatedCandidates)))
 		FailedValidationsTotal.Add(float64(len(candidates)), map[string]string{ConsolidationTypeLabel: c.validationType})
 		return nil, NewChurnValidationError(fmt.Errorf("%d candidates are no longer valid", len(candidates)-len(validatedCandidates)))
 	}
@@ -280,21 +315,33 @@ func (c *ConsolidationValidator) validateCandidates(ctx context.Context, candida
 	//  a. A pod was nominated to the candidate
 	//  b. Disrupting the candidate would violate node disruption budgets
 	for _, vc := range validatedCandidates {
+		candidateCtx := tracing.StartSpan(ctx, "validateCandidates.filterCandidates", trace.WithAttributes(
+			attribute.String("candidate.node", vc.Node.Name),
+			attribute.String("candidate.nodeclaim", vc.NodeClaim.Name),
+			attribute.String("candidate.nodepool", vc.NodePool.Name)),
+		)
 		if c.cluster.IsNodeNominated(vc.ProviderID()) {
+			tracing.EndSpan(candidateCtx, fmt.Errorf("candidate was nominated during validation"))
 			FailedValidationsTotal.Add(float64(len(candidates)), map[string]string{ConsolidationTypeLabel: c.validationType})
 			return nil, NewBudgetValidationError(fmt.Errorf("a candidate was nominated during validation"))
 		}
 		if disruptionBudgetMapping[vc.NodePool.Name] == 0 {
+			tracing.EndSpan(candidateCtx, fmt.Errorf("candidate can no longer be disrupted without violating budgets"))
 			FailedValidationsTotal.Add(float64(len(candidates)), map[string]string{ConsolidationTypeLabel: c.validationType})
 			return nil, NewBudgetValidationError(fmt.Errorf("a candidate can no longer be disrupted without violating budgets"))
 		}
+		tracing.EndSpan(candidateCtx, nil)
 		disruptionBudgetMapping[vc.NodePool.Name]--
 	}
+	tracing.SpanFromContext(ctx).AddEvent("successfully validated candidates")
 	return validatedCandidates, nil
 }
 
 // ValidateCommand validates a command for a Method
-func (v *validation) validateCommand(ctx context.Context, cmd Command, candidates []*Candidate) error {
+func (v *validation) validateCommand(ctx context.Context, cmd Command, candidates []*Candidate) (err error) {
+	ctx = tracing.StartSpan(ctx, "validateCommand")
+	defer tracing.EndSpan(ctx, err)
+
 	// None of the chosen candidate are valid for execution, so retry
 	if len(candidates) == 0 {
 		return NewValidationError(fmt.Errorf("no candidates"))

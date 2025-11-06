@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/samber/lo"
+	"go.opentelemetry.io/otel/attribute"
 	corev1 "k8s.io/api/core/v1"
 	controllerruntime "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -31,6 +32,7 @@ import (
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/operator/injection"
+	"sigs.k8s.io/karpenter/pkg/operator/tracing"
 	utilscontroller "sigs.k8s.io/karpenter/pkg/utils/controller"
 	"sigs.k8s.io/karpenter/pkg/utils/pod"
 )
@@ -63,6 +65,10 @@ func (c *PodController) Name() string {
 
 func (c *PodController) Reconcile(ctx context.Context, p *corev1.Pod) (reconcile.Result, error) {
 	ctx = injection.WithControllerName(ctx, c.Name()) //nolint:ineffassign,staticcheck
+	tracing.SpanFromContext(ctx).SetAttributes(
+		attribute.String("pod.name", p.Name),
+		attribute.String("pod.namespace", p.Namespace),
+	)
 
 	if !pod.IsProvisionable(p) {
 		return reconcile.Result{}, nil
@@ -82,7 +88,7 @@ func (c *PodController) Register(ctx context.Context, m manager.Manager) error {
 		Named(c.Name()).
 		For(&corev1.Pod{}).
 		WithOptions(controller.Options{MaxConcurrentReconciles: utilscontroller.LinearScaleReconciles(utilscontroller.CPUCount(ctx), minReconciles, maxReconciles)}).
-		Complete(reconcile.AsReconciler(m.GetClient(), c))
+		Complete(tracing.WithObjectTracing[*corev1.Pod](reconcile.AsReconciler(m.GetClient(), c), c.Name()))
 }
 
 // NodeController for the resource
@@ -107,6 +113,7 @@ func (c *NodeController) Name() string {
 func (c *NodeController) Reconcile(ctx context.Context, n *corev1.Node) (reconcile.Result, error) {
 	//nolint:ineffassign
 	ctx = injection.WithControllerName(ctx, c.Name()) //nolint:ineffassign,staticcheck
+	tracing.SpanFromContext(ctx).SetAttributes(attribute.String("node.name", n.Name))
 
 	// If the disruption taint doesn't exist and the deletion timestamp isn't set, it's not being disrupted.
 	// We don't check the deletion timestamp here, as we expect the termination controller to eventually set
@@ -129,5 +136,5 @@ func (c *NodeController) Register(ctx context.Context, m manager.Manager) error 
 		Named(c.Name()).
 		For(&corev1.Node{}).
 		WithOptions(controller.Options{MaxConcurrentReconciles: utilscontroller.LinearScaleReconciles(utilscontroller.CPUCount(ctx), minReconciles, maxReconciles)}).
-		Complete(reconcile.AsReconciler(m.GetClient(), c))
+		Complete(tracing.WithObjectTracing[*corev1.Node](reconcile.AsReconciler(m.GetClient(), c), c.Name()))
 }

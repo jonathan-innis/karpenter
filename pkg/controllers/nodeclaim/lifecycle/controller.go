@@ -24,6 +24,7 @@ import (
 	"github.com/awslabs/operatorpkg/status"
 	"github.com/patrickmn/go-cache"
 	"github.com/samber/lo"
+	"go.opentelemetry.io/otel/attribute"
 	"go.uber.org/multierr"
 	"golang.org/x/time/rate"
 	corev1 "k8s.io/api/core/v1"
@@ -49,6 +50,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/events"
 	"sigs.k8s.io/karpenter/pkg/metrics"
 	"sigs.k8s.io/karpenter/pkg/operator/injection"
+	"sigs.k8s.io/karpenter/pkg/operator/tracing"
 	utilscontroller "sigs.k8s.io/karpenter/pkg/utils/controller"
 	nodeclaimutils "sigs.k8s.io/karpenter/pkg/utils/nodeclaim"
 	"sigs.k8s.io/karpenter/pkg/utils/result"
@@ -111,7 +113,7 @@ func (c *Controller) Register(ctx context.Context, m manager.Manager) error {
 			),
 			MaxConcurrentReconciles: maxConcurrentReconciles,
 		}).
-		Complete(reconcile.AsReconciler(m.GetClient(), c))
+		Complete(tracing.WithObjectTracing[*v1.NodeClaim](reconcile.AsReconciler(m.GetClient(), c), c.Name()))
 }
 
 func (c *Controller) Name() string {
@@ -121,16 +123,27 @@ func (c *Controller) Name() string {
 // nolint:gocyclo
 func (c *Controller) Reconcile(ctx context.Context, nodeClaim *v1.NodeClaim) (reconcile.Result, error) {
 	ctx = injection.WithControllerName(ctx, c.Name())
+
+	tracing.SpanFromContext(ctx).SetAttributes(
+		attribute.String("nodeclaim.name", nodeClaim.Name),
+		attribute.String("nodeclaim.namespace", nodeClaim.Namespace),
+	)
+
 	if nodeClaim.Status.ProviderID != "" {
+		tracing.SpanFromContext(ctx).SetAttributes(attribute.String("nodeclaim.provider_id", nodeClaim.Status.ProviderID))
 		ctx = log.IntoContext(ctx, log.FromContext(ctx).WithValues("provider-id", nodeClaim.Status.ProviderID))
 	}
 	if nodeClaim.Status.NodeName != "" {
+		tracing.SpanFromContext(ctx).SetAttributes(attribute.String("nodeclaim.node_name", nodeClaim.Status.NodeName))
 		ctx = log.IntoContext(ctx, log.FromContext(ctx).WithValues("Node", klog.KRef("", nodeClaim.Status.NodeName)))
 	}
 	if !nodeclaimutils.IsManaged(nodeClaim, c.cloudProvider) {
+		tracing.SpanFromContext(ctx).SetAttributes(attribute.Bool("nodeclaim.managed", false))
 		return reconcile.Result{}, nil
 	}
+	tracing.SpanFromContext(ctx).SetAttributes(attribute.Bool("nodeclaim.managed", true))
 	if !nodeClaim.DeletionTimestamp.IsZero() {
+		tracing.SpanFromContext(ctx).SetAttributes(attribute.Bool("nodeclaim.deleting", true))
 		return c.finalize(ctx, nodeClaim)
 	}
 
@@ -185,6 +198,8 @@ func (c *Controller) Reconcile(ctx context.Context, nodeClaim *v1.NodeClaim) (re
 
 //nolint:gocyclo
 func (c *Controller) finalize(ctx context.Context, nodeClaim *v1.NodeClaim) (reconcile.Result, error) {
+	tracing.SpanFromContext(ctx).SetAttributes(attribute.String("nodeclaim.name", nodeClaim.Name))
+
 	if !controllerutil.ContainsFinalizer(nodeClaim, v1.TerminationFinalizer) {
 		return reconcile.Result{}, nil
 	}

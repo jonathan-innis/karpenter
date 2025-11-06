@@ -19,13 +19,17 @@ package disruption
 import (
 	"context"
 	"errors"
+	"fmt"
 	"slices"
 	"sort"
 
 	"github.com/samber/lo"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 	"k8s.io/utils/clock"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
+	"sigs.k8s.io/karpenter/pkg/operator/tracing"
 	"sigs.k8s.io/karpenter/pkg/utils/pretty"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
@@ -56,11 +60,31 @@ func NewDrift(kubeClient client.Client, cluster *state.Cluster, provisioner *pro
 
 // ShouldDisrupt is a predicate used to filter candidates
 func (d *Drift) ShouldDisrupt(ctx context.Context, c *Candidate) bool {
-	return !c.OwnedByStaticNodePool() && c.NodeClaim.StatusConditions().Get(string(d.Reason())).IsTrue()
+	ctx = tracing.StartSpan(ctx, "ShouldDisrupt", trace.WithAttributes(
+		attribute.String("candidate.node", c.Node.Name),
+		attribute.String("candidate.nodeclaim", c.NodeClaim.Name),
+		attribute.String("candidate.nodepool", c.NodePool.Name)),
+	)
+
+	if c.OwnedByStaticNodePool() {
+		tracing.EndSpan(ctx, fmt.Errorf("candidate is owned by a static nodepool"))
+		return false
+	}
+	if !c.NodeClaim.StatusConditions().Get(string(d.Reason())).IsTrue() {
+		tracing.EndSpan(ctx, fmt.Errorf("candidate does not have the drifted condition"))
+		return false
+	}
+	tracing.EndSpan(ctx, nil)
+	return true
 }
 
 // ComputeCommand generates a disruption command given candidates
-func (d *Drift) ComputeCommands(ctx context.Context, disruptionBudgetMapping map[string]int, candidates ...*Candidate) ([]Command, error) {
+func (d *Drift) ComputeCommands(ctx context.Context, disruptionBudgetMapping map[string]int, candidates ...*Candidate) (cmds []Command, err error) {
+	ctx = tracing.StartSpan(ctx, "ComputeCommands", trace.WithAttributes(
+		attribute.Int("candidates.count", len(candidates))),
+	)
+	defer tracing.EndSpan(ctx, err)
+
 	sort.Slice(candidates, func(i int, j int) bool {
 		return candidates[i].NodeClaim.StatusConditions().Get(string(d.Reason())).LastTransitionTime.Time.Before(
 			candidates[j].NodeClaim.StatusConditions().Get(string(d.Reason())).LastTransitionTime.Time)
@@ -69,15 +93,26 @@ func (d *Drift) ComputeCommands(ctx context.Context, disruptionBudgetMapping map
 	emptyCandidates, nonEmptyCandidates := lo.FilterReject(candidates, func(c *Candidate, _ int) bool {
 		return len(c.reschedulablePods) == 0
 	})
+	trace.WithAttributes(
+		attribute.Int("candidates.count.empty", len(emptyCandidates)),
+		attribute.Int("candidates.count.nonEmpty", len(nonEmptyCandidates)),
+	)
 
 	// Prioritize empty candidates since we want them to get priority over non-empty candidates if the budget is constrained.
 	// Disrupting empty candidates first also helps reduce the overall churn because if a non-empty candidate is disrupted first,
 	// the pods from that node can reschedule on the empty nodes and will need to move again when those nodes get disrupted.
 	for _, candidate := range slices.Concat(emptyCandidates, nonEmptyCandidates) {
+		candidateCtx := tracing.StartSpan(ctx, "ComputeCommands.filterCandidates", trace.WithAttributes(
+			attribute.String("candidate.node", candidate.Node.Name),
+			attribute.String("candidate.nodeclaim", candidate.NodeClaim.Name),
+			attribute.String("candidate.nodepool", candidate.NodePool.Name)),
+		)
 		// If the disruption budget doesn't allow this candidate to be disrupted,
 		// continue to the next candidate. We don't need to decrement any budget
 		// counter since drift commands can only have one candidate.
 		if disruptionBudgetMapping[candidate.NodePool.Name] == 0 {
+			tracing.SpanFromContext(candidateCtx).AddEvent("candidate is constrained by budgets")
+			tracing.EndSpan(candidateCtx, nil)
 			continue
 		}
 		// Check if we need to create any NodeClaims.
@@ -85,21 +120,31 @@ func (d *Drift) ComputeCommands(ctx context.Context, disruptionBudgetMapping map
 		if err != nil {
 			// if a candidate is now deleting, just retry
 			if errors.Is(err, errCandidateDeleting) {
+				tracing.SpanFromContext(candidateCtx).AddEvent("candidate is deleting")
+				tracing.EndSpan(candidateCtx, nil)
 				continue
 			}
+			tracing.EndSpan(candidateCtx, err)
 			return []Command{}, err
 		}
 		// Emit an event that we couldn't reschedule the pods on the node.
 		if !results.AllNonPendingPodsScheduled() {
 			d.recorder.Publish(disruptionevents.Blocked(candidate.Node, candidate.NodeClaim, pretty.Sentence(results.NonPendingPodSchedulingErrors()))...)
+			tracing.SpanFromContext(candidateCtx).AddEvent(fmt.Sprintf("not all non-pending pods were scheduled, %s", pretty.Sentence(results.NonPendingPodSchedulingErrors())))
+			tracing.EndSpan(candidateCtx, nil)
 			continue
 		}
-
 		cmd := Command{
 			Candidates:   []*Candidate{candidate},
 			Replacements: replacementsFromNodeClaims(results.NewNodeClaims...),
 			Results:      results,
 		}
+		tracing.SpanFromContext(candidateCtx).AddEvent("found valid drifted command")
+		tracing.EndSpan(candidateCtx, nil)
+		tracing.SpanFromContext(ctx).AddEvent("found valid drifted command", trace.WithAttributes(
+			attribute.Int("candidates.count", len(cmd.Candidates)),
+			attribute.Int("replacements.count", len(cmd.Replacements))),
+		)
 		return []Command{cmd}, nil
 
 	}

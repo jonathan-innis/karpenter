@@ -25,10 +25,13 @@ import (
 
 	"github.com/awslabs/operatorpkg/option"
 	"github.com/samber/lo"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
+	"sigs.k8s.io/karpenter/pkg/operator/tracing"
 )
 
 var SingleNodeConsolidationTimeoutDuration = 3 * time.Minute
@@ -53,8 +56,14 @@ func NewSingleNodeConsolidation(c consolidation, opts ...option.Function[MethodO
 
 // ComputeCommand generates a disruption command given candidates
 // nolint:gocyclo
-func (s *SingleNodeConsolidation) ComputeCommands(ctx context.Context, disruptionBudgetMapping map[string]int, candidates ...*Candidate) ([]Command, error) {
+func (s *SingleNodeConsolidation) ComputeCommands(ctx context.Context, disruptionBudgetMapping map[string]int, candidates ...*Candidate) (cmds []Command, err error) {
+	ctx = tracing.StartSpan(ctx, "ComputeCommands", trace.WithAttributes(
+		attribute.Int("candidates.count", len(candidates))),
+	)
+	defer tracing.EndSpan(ctx, err)
+
 	if s.IsConsolidated() {
+		tracing.SpanFromContext(ctx).AddEvent("cluster has been recently consolidated so exiting early")
 		return []Command{}, nil
 	}
 	candidates = s.SortCandidates(ctx, candidates)
@@ -66,8 +75,17 @@ func (s *SingleNodeConsolidation) ComputeCommands(ctx context.Context, disruptio
 	unseenNodePools := sets.New(lo.Map(candidates, func(c *Candidate, _ int) string { return c.NodePool.Name })...)
 
 	for i, candidate := range candidates {
+		candidateCtx := tracing.StartSpan(ctx, "ComputeCommands.evaluateCandidate", trace.WithAttributes(
+			attribute.String("candidate.node", candidate.Node.Name),
+			attribute.String("candidate.nodeclaim", candidate.NodeClaim.Name),
+			attribute.String("candidate.nodepool", candidate.NodePool.Name),
+			attribute.Int("candidate.reschedulablePods", len(candidate.reschedulablePods)),
+			attribute.Int("candidate.remainingBudget", disruptionBudgetMapping[candidate.NodePool.Name])),
+		)
 		if s.clock.Now().After(timeout) {
 			ConsolidationTimeoutsTotal.Inc(map[string]string{ConsolidationTypeLabel: s.ConsolidationType()})
+			tracing.SpanFromContext(candidateCtx).AddEvent("abandoning single-node consolidation due to timeout")
+			tracing.EndSpan(candidateCtx, nil)
 			log.FromContext(ctx).V(1).Info("abandoning single-node consolidation due to timeout", "candidates_evaluated", i)
 
 			s.PreviouslyUnseenNodePools = unseenNodePools
@@ -82,32 +100,52 @@ func (s *SingleNodeConsolidation) ComputeCommands(ctx context.Context, disruptio
 		// counter since single node consolidation commands can only have one candidate.
 		if disruptionBudgetMapping[candidate.NodePool.Name] == 0 {
 			constrainedByBudgets = true
+			tracing.SpanFromContext(candidateCtx).AddEvent("candidate is constrained by budgets")
+			tracing.EndSpan(candidateCtx, nil)
 			continue
 		}
 		// Filter out empty candidates. If there was an empty node that wasn't consolidated before this, we should
 		// assume that it was due to budgets. If we don't filter out budgets, users who set a budget for `empty`
 		// can find their nodes disrupted here.
 		if len(candidate.reschedulablePods) == 0 {
+			tracing.SpanFromContext(candidateCtx).AddEvent("candidate is empty")
+			tracing.EndSpan(candidateCtx, nil)
 			continue
 		}
 
 		// compute a possible consolidation option
-		cmd, err := s.computeConsolidation(ctx, candidate)
+		cmd, err := s.computeConsolidation(candidateCtx, candidate)
 		if err != nil {
-			log.FromContext(ctx).Error(err, "failed computing consolidation")
+			log.FromContext(candidateCtx).Error(err, "failed computing consolidation")
+			tracing.EndSpan(candidateCtx, err)
 			continue
 		}
 		if cmd.Decision() == NoOpDecision {
+			tracing.SpanFromContext(candidateCtx).AddEvent("candidate produced a no-op decision")
+			tracing.EndSpan(candidateCtx, nil)
 			continue
 		}
 		if _, err = s.validator.Validate(ctx, cmd, commandValidationDelay); err != nil {
 			if IsValidationError(err) {
+				tracing.SpanFromContext(candidateCtx).AddEvent(fmt.Sprintf("candidate failed validation and produced an invalid command due to pod churn, %s", err.Error()))
+				tracing.EndSpan(candidateCtx, nil)
+
 				reason := getValidationFailureReason(err)
 				cmd.EmitRejectedEvents(s.recorder, reason)
 				return []Command{}, nil
 			}
+			tracing.EndSpan(candidateCtx, fmt.Errorf("validating consolidation, %w", err))
 			return []Command{}, fmt.Errorf("validating consolidation, %w", err)
 		}
+		tracing.SpanFromContext(candidateCtx).AddEvent("found valid single-node consolidation command", trace.WithAttributes(
+			attribute.Int("candidates.count", len(cmd.Candidates)),
+			attribute.Int("replacements.count", len(cmd.Replacements))),
+		)
+		tracing.EndSpan(candidateCtx, nil)
+		tracing.SpanFromContext(ctx).AddEvent("found valid single-node consolidation command", trace.WithAttributes(
+			attribute.Int("candidates.count", len(cmd.Candidates)),
+			attribute.Int("replacements.count", len(cmd.Replacements))),
+		)
 		return []Command{cmd}, nil
 	}
 
@@ -120,6 +158,7 @@ func (s *SingleNodeConsolidation) ComputeCommands(ctx context.Context, disruptio
 
 	s.PreviouslyUnseenNodePools = unseenNodePools
 
+	tracing.SpanFromContext(ctx).AddEvent("completed search of all single-node consolidation commands, failed to find a single-node consolidation")
 	return []Command{}, nil
 }
 

@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"time"
 
+	"go.opentelemetry.io/otel/attribute"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/types"
@@ -33,6 +34,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
+	"sigs.k8s.io/karpenter/pkg/operator/tracing"
 	nodeutils "sigs.k8s.io/karpenter/pkg/utils/node"
 	nodeclaimutils "sigs.k8s.io/karpenter/pkg/utils/nodeclaim"
 	podutils "sigs.k8s.io/karpenter/pkg/utils/pod"
@@ -61,11 +63,17 @@ func NewController(clk clock.Clock, kubeClient client.Client, cloudProvider clou
 
 //nolint:gocyclo
 func (c *Controller) Reconcile(ctx context.Context, pod *corev1.Pod) (reconcile.Result, error) {
+	tracing.SpanFromContext(ctx).SetAttributes(
+		attribute.String("pod.name", pod.Name),
+		attribute.String("pod.namespace", pod.Namespace),
+	)
+
 	// If the pod doesn't have a node name, we don't know which node this pod refers to.
 	// or if this is a daemonset
 	if pod.Spec.NodeName == "" || podutils.IsOwnedByDaemonSet(pod) {
 		return reconcile.Result{}, nil
 	}
+	tracing.SpanFromContext(ctx).SetAttributes(attribute.String("pod.node_name", pod.Spec.NodeName))
 
 	node := &corev1.Node{}
 	if err := c.kubeClient.Get(ctx, types.NamespacedName{Name: pod.Spec.NodeName}, node); err != nil {
@@ -93,6 +101,7 @@ func (c *Controller) Reconcile(ctx context.Context, pod *corev1.Pod) (reconcile.
 		if err = c.kubeClient.Status().Patch(ctx, nc, client.MergeFrom(stored)); err != nil {
 			return reconcile.Result{}, client.IgnoreNotFound(err)
 		}
+		tracing.SpanFromContext(ctx).SetAttributes(attribute.Bool("nodeclaim.updated", true))
 	}
 	return reconcile.Result{}, nil
 }
@@ -120,5 +129,5 @@ func (c *Controller) Register(ctx context.Context, m manager.Manager) error {
 				return bound || terminal || terminating
 			},
 		}).
-		Complete(reconcile.AsReconciler(m.GetClient(), c))
+		Complete(tracing.WithObjectTracing[*corev1.Pod](reconcile.AsReconciler(m.GetClient(), c), c.Name()))
 }

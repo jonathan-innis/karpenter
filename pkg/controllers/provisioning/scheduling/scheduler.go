@@ -29,6 +29,9 @@ import (
 	"github.com/awslabs/operatorpkg/option"
 	"github.com/awslabs/operatorpkg/serrors"
 	"github.com/samber/lo"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/baggage"
+	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/multierr"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -47,6 +50,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/metrics"
 	"sigs.k8s.io/karpenter/pkg/operator/injection"
 	karpopts "sigs.k8s.io/karpenter/pkg/operator/options"
+	"sigs.k8s.io/karpenter/pkg/operator/tracing"
 	"sigs.k8s.io/karpenter/pkg/scheduling"
 
 	"sigs.k8s.io/karpenter/pkg/utils/disruption"
@@ -418,7 +422,10 @@ func (r Results) TruncateInstanceTypes(ctx context.Context, maxInstanceTypes int
 	return r
 }
 
-func (s *Scheduler) Solve(ctx context.Context, pods []*corev1.Pod) (Results, error) {
+func (s *Scheduler) Solve(ctx context.Context, pods []*corev1.Pod) (res Results, err error) {
+	ctx = tracing.StartSpan(ctx, "Solve")
+	defer tracing.EndSpan(ctx, err)
+
 	defer metrics.Measure(DurationSeconds, map[string]string{ControllerLabel: injection.GetControllerName(ctx)})()
 	// We loop trying to schedule unschedulable pods as long as we are making progress.  This solves a few
 	// issues including pods with affinity to another pod in the batch. We could topo-sort to solve this, but it wouldn't
@@ -449,25 +456,33 @@ func (s *Scheduler) Solve(ctx context.Context, pods []*corev1.Pod) (Results, err
 		// Try the next pod
 		pod, ok := q.Pop()
 		if !ok {
+			tracing.SpanFromContext(ctx).AddEvent("no more pods to schedule")
 			break
 		}
+		podCtx := baggage.ContextWithBaggage(ctx, lo.Must(baggage.New(lo.Must(baggage.NewMember("pod.name", pod.Name)), lo.Must(baggage.NewMember("pod.namespace", pod.Namespace)))))
+		podCtx = tracing.StartSpan(podCtx, "schedulingLoop")
 		// We relax the pod all the way the first time we see it
 		// If we don't schedule it, we store the original pod (with preferences)
 		// in the queue and give ourselves another chance to schedule it later
-		if err := s.trySchedule(ctx, pod.DeepCopy()); err != nil {
+		if err := s.trySchedule(podCtx, pod.DeepCopy()); err != nil {
 			if errors.Is(err, context.DeadlineExceeded) {
-				log.FromContext(ctx).V(1).WithValues("duration", s.clock.Since(startTime).Truncate(time.Second), "scheduling-id", string(s.uuid)).Info("scheduling simulation timed out")
+				log.FromContext(podCtx).V(1).WithValues("duration", s.clock.Since(startTime).Truncate(time.Second), "scheduling-id", string(s.uuid)).Info("scheduling simulation timed out")
+				tracing.SpanFromContext(ctx).AddEvent(fmt.Sprintf("scheduling simulation timed out after %s", s.clock.Since(startTime).String()))
+				tracing.EndSpan(podCtx, err)
 				break
 			}
 			podErrors[pod] = err
-			if e := s.topology.Update(ctx, pod); e != nil && !errors.Is(e, context.DeadlineExceeded) {
-				log.FromContext(ctx).Error(e, "failed updating topology")
+			if e := s.topology.Update(podCtx, pod); e != nil && !errors.Is(e, context.DeadlineExceeded) {
+				log.FromContext(podCtx).Error(e, "failed updating topology")
+				tracing.EndSpan(podCtx, fmt.Errorf("failed updating topology, %w", e))
 			}
 			// Update the cached podData since the pod was relaxed, and it could have changed its requirement set
 			s.updateCachedPodData(pod)
 			q.Push(pod)
+			tracing.EndSpan(podCtx, err)
 		} else {
 			delete(podErrors, pod)
+			tracing.EndSpan(podCtx, nil)
 		}
 	}
 	UnfinishedWorkSeconds.Delete(map[string]string{ControllerLabel: injection.GetControllerName(ctx), schedulingIDLabel: string(s.uuid)})
@@ -490,13 +505,16 @@ func (s *Scheduler) Solve(ctx context.Context, pods []*corev1.Pod) (Results, err
 	}, ctx.Err()
 }
 
-func (s *Scheduler) trySchedule(ctx context.Context, p *corev1.Pod) error {
+func (s *Scheduler) trySchedule(ctx context.Context, p *corev1.Pod) (err error) {
+	ctx = tracing.StartSpan(ctx, "trySchedule")
+	defer tracing.EndSpan(ctx, err)
 	for {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
 		err := s.add(ctx, p)
 		if err == nil {
+			tracing.SpanFromContext(ctx).AddEvent("successfully scheduled pod")
 			return nil
 		}
 		// We should only relax the pod's requirements when the error is not a reserved offering error because the pod may be
@@ -515,9 +533,11 @@ func (s *Scheduler) trySchedule(ctx context.Context, p *corev1.Pod) error {
 		if relaxed := s.preferences.Relax(ctx, p); !relaxed {
 			return err
 		}
+		tracing.SpanFromContext(ctx).AddEvent("relaxed pod requirements")
 		if e := s.topology.Update(ctx, p); e != nil && !errors.Is(e, context.DeadlineExceeded) {
 			log.FromContext(ctx).Error(e, "failed updating topology")
 		}
+		tracing.SpanFromContext(ctx).AddEvent("updated topology with new updated relaxed requirements")
 		// Update the cached podData since the pod was relaxed, and it could have changed its requirement set
 		s.updateCachedPodData(p)
 	}
@@ -545,27 +565,30 @@ func (s *Scheduler) updateCachedPodData(p *corev1.Pod) {
 	}
 }
 
-func (s *Scheduler) add(ctx context.Context, pod *corev1.Pod) error {
+func (s *Scheduler) add(ctx context.Context, pod *corev1.Pod) (err error) {
+	ctx = tracing.StartSpan(ctx, "add")
+	defer tracing.EndSpan(ctx, err)
+
 	// Check if pod has DRA requirements - if so, return DRA error when IgnoreDRARequests is enabled
 	if s.cachedPodData[pod.UID].HasResourceClaimRequests && karpopts.FromContext(ctx).IgnoreDRARequests {
 		return NewDRAError(fmt.Errorf("pod has Dynamic Resource Allocation requirements that are not yet supported by Karpenter"))
 	}
 
 	// first try to schedule against an in-flight real node
-	if err := s.addToExistingNode(ctx, pod); err == nil {
+	if err = s.addToExistingNode(ctx, pod); err == nil {
 		return nil
 	}
 	// Consider using https://pkg.go.dev/container/heap
 	sort.Slice(s.newNodeClaims, func(a, b int) bool { return len(s.newNodeClaims[a].Pods) < len(s.newNodeClaims[b].Pods) })
 
 	// Pick existing node that we are about to create
-	if err := s.addToInflightNode(ctx, pod); err == nil {
+	if err = s.addToInflightNode(ctx, pod); err == nil {
 		return nil
 	}
 	if len(s.nodeClaimTemplates) == 0 {
 		return fmt.Errorf("nodepool requirements filtered out all available instance types")
 	}
-	err := s.addToNewNodeClaim(ctx, pod)
+	err = s.addToNewNodeClaim(ctx, pod)
 	if err == nil {
 		return nil
 	}
@@ -573,7 +596,9 @@ func (s *Scheduler) add(ctx context.Context, pod *corev1.Pod) error {
 }
 
 func (s *Scheduler) addToExistingNode(ctx context.Context, p *corev1.Pod) error {
-	idx := math.MaxInt
+	ctx = tracing.StartSpan(ctx, "addToExistingNode")
+	defer tracing.EndSpan(ctx, err)
+
 	var mu sync.Mutex
 
 	var existingNode *ExistingNode
@@ -585,6 +610,13 @@ func (s *Scheduler) addToExistingNode(ctx context.Context, p *corev1.Pod) error 
 		return err
 	}
 	parallelizeUntil(s.numConcurrentReconciles, len(s.existingNodes), func(i int) bool {
+		existingNodeCtx := tracing.StartSpan(ctx, "existingNodeCanAdd", trace.WithAttributes(
+			attribute.Int("i", i),
+			attribute.String("node.name", s.existingNodes[i].NodeName()),
+			attribute.String("nodeclaim.name", s.existingNodes[i].NodeClaimName()),
+		))
+		defer tracing.EndSpan(existingNodeCtx, err)
+
 		if s.existingNodes[i].isUnderConsolidateAfter && (!pod.IsPending(p) && !s.deletingNodeNames.Has(p.Spec.NodeName)) {
 			// We shouldn't try to schedule candidate pods onto nodes that are under consolidate after.
 			// Pending pods and pods from deleting nodes are exempt.
@@ -592,16 +624,19 @@ func (s *Scheduler) addToExistingNode(ctx context.Context, p *corev1.Pod) error 
 		}
 		r, err := s.existingNodes[i].CanAdd(p, s.cachedPodData[p.UID], volumes)
 		if err == nil {
+			tracing.SpanFromContext(existingNodeCtx).AddEvent("successfully scheduled pod to existing node")
 			mu.Lock()
 			defer mu.Unlock()
 
 			// Ensure that we always take an earlier successful schedule to keep consistent ordering
 			if i >= idx {
+				tracing.SpanFromContext(existingNodeCtx).AddEvent("skipping existing node, already scheduled to a higher priority node")
 				return false
 			}
 			existingNode = s.existingNodes[i]
 			requirements = r
 			idx = i
+			tracing.SpanFromContext(existingNodeCtx).AddEvent("updated existing node for pod scheduling")
 			return false
 		}
 		return true
@@ -609,12 +644,20 @@ func (s *Scheduler) addToExistingNode(ctx context.Context, p *corev1.Pod) error 
 	// If we set the existingNode to something valid, this means that we successfully scheduled to one of these nodes
 	if existingNode != nil {
 		existingNode.Add(p, s.cachedPodData[p.UID], requirements, volumes)
+		tracing.SpanFromContext(ctx).AddEvent("successfully scheduled pod to existing node", trace.WithAttributes(
+			attribute.Int("i", idx),
+			attribute.String("node", existingNode.NodeName()),
+			attribute.String("nodeclaim", existingNode.NodeClaimName()),
+		))
 		return nil
 	}
 	return fmt.Errorf("failed scheduling pod to existing nodes")
 }
 
-func (s *Scheduler) addToInflightNode(ctx context.Context, pod *corev1.Pod) error {
+func (s *Scheduler) addToInflightNode(ctx context.Context, pod *corev1.Pod) (err error) {
+	ctx = tracing.StartSpan(ctx, "addToInflightNode")
+	defer tracing.EndSpan(ctx, err)
+
 	idx := math.MaxInt
 	var mu sync.Mutex
 
@@ -623,13 +666,22 @@ func (s *Scheduler) addToInflightNode(ctx context.Context, pod *corev1.Pod) erro
 	var updatedInstanceTypes []*cloudprovider.InstanceType
 	var offeringsToReserve []*cloudprovider.Offering
 	parallelizeUntil(s.numConcurrentReconciles, len(s.newNodeClaims), func(i int) bool {
+		var err error
+		inflightNodeClaimCtx := tracing.StartSpan(ctx, "inflightNodeCanAdd", trace.WithAttributes(
+			attribute.Int("i", i),
+			attribute.String("nodepool", s.newNodeClaims[i].NodePoolName),
+		))
+		defer tracing.EndSpan(inflightNodeClaimCtx, err)
+
 		r, its, ofr, err := s.newNodeClaims[i].CanAdd(ctx, pod, s.cachedPodData[pod.UID], false)
 		if err == nil {
+			tracing.SpanFromContext(inflightNodeClaimCtx).AddEvent("successfully scheduled pod to inflight node")
 			mu.Lock()
 			defer mu.Unlock()
 
 			// Ensure that we always take an earlier successful schedule to keep consistent ordering
 			if i >= idx {
+				tracing.SpanFromContext(inflightNodeClaimCtx).AddEvent("skipping inflight node, already scheduled to a higher priority node")
 				return false
 			}
 			inflightNodeClaim = s.newNodeClaims[i]
@@ -637,19 +689,27 @@ func (s *Scheduler) addToInflightNode(ctx context.Context, pod *corev1.Pod) erro
 			updatedInstanceTypes = its
 			offeringsToReserve = ofr
 			idx = i
+			tracing.SpanFromContext(inflightNodeClaimCtx).AddEvent("updated inflight node for pod scheduling")
 			return false
 		}
 		return true
 	})
 	if inflightNodeClaim != nil {
 		inflightNodeClaim.Add(pod, s.cachedPodData[pod.UID], updatedRequirements, updatedInstanceTypes, offeringsToReserve)
+		tracing.SpanFromContext(ctx).AddEvent("successfully scheduled pod to inflight node", trace.WithAttributes(
+			attribute.Int("i", idx),
+			attribute.String("nodepool", inflightNodeClaim.NodePoolName),
+		))
 		return nil
 	}
 	return fmt.Errorf("failed scheduling pod to inflight nodes")
 }
 
 //nolint:gocyclo
-func (s *Scheduler) addToNewNodeClaim(ctx context.Context, pod *corev1.Pod) error {
+func (s *Scheduler) addToNewNodeClaim(ctx context.Context, pod *corev1.Pod) (err error) {
+	ctx = tracing.StartSpan(ctx, "addToNewNodeClaim")
+	defer tracing.EndSpan(ctx, err)
+
 	idx := math.MaxInt
 	var mu sync.Mutex
 
@@ -660,6 +720,12 @@ func (s *Scheduler) addToNewNodeClaim(ctx context.Context, pod *corev1.Pod) erro
 
 	errs := make([]error, len(s.nodeClaimTemplates))
 	parallelizeUntil(s.numConcurrentReconciles, len(s.nodeClaimTemplates), func(i int) bool {
+		newNodeClaimCtx := tracing.StartSpan(ctx, "newNodeClaimCanAdd", trace.WithAttributes(
+			attribute.Int("i", i),
+			attribute.String("nodepool", s.nodeClaimTemplates[i].NodePoolName),
+		))
+		defer tracing.EndSpan(newNodeClaimCtx, errs[i])
+
 		its := s.nodeClaimTemplates[i].InstanceTypeOptions
 		// if limits have been applied to the nodepool, ensure we filter instance types to avoid violating those limits
 		if remaining, ok := s.remainingResources[s.nodeClaimTemplates[i].NodePoolName]; ok {
@@ -679,6 +745,7 @@ func (s *Scheduler) addToNewNodeClaim(ctx context.Context, pod *corev1.Pod) erro
 				).Info("instance types were excluded because they would breach limits",
 					"excluded", len(s.nodeClaimTemplates[i].InstanceTypeOptions)-len(its),
 					"total", len(s.nodeClaimTemplates[i].InstanceTypeOptions))
+				tracing.SpanFromContext(newNodeClaimCtx).AddEvent(fmt.Sprintf("%d out of %d instance types were excluded because they would breach limits", len(s.nodeClaimTemplates[i].InstanceTypeOptions)-len(its), len(s.nodeClaimTemplates[i].InstanceTypeOptions)))
 			}
 		}
 		nodeClaim := NewNodeClaim(s.nodeClaimTemplates[i], s.topology, s.daemonOverhead[s.nodeClaimTemplates[i]], s.daemonHostPortUsage[s.nodeClaimTemplates[i]], its, s.reservationManager, s.reservedOfferingMode)
@@ -706,12 +773,14 @@ func (s *Scheduler) addToNewNodeClaim(ctx context.Context, pod *corev1.Pod) erro
 			}
 			return true
 		}
+		tracing.SpanFromContext(newNodeClaimCtx).AddEvent("successfully scheduled pod to new node claim")
 		mu.Lock()
 		defer mu.Unlock()
 
 		// Ensure that we always take an earlier successful schedule to keep consistent ordering
 		// We care about this particularly with NewNodeClaims because NodeClaims should be evaluated by weight
 		if i >= idx {
+			tracing.SpanFromContext(newNodeClaimCtx).AddEvent("skipping new node claim, already scheduled to a higher priority node")
 			return false
 		}
 
@@ -720,17 +789,15 @@ func (s *Scheduler) addToNewNodeClaim(ctx context.Context, pod *corev1.Pod) erro
 			original := nodeClaim.Requirements.Get(k).MinValues
 			return original != nil && updated != nil && lo.FromPtr(updated) < lo.FromPtr(original)
 		})
-		if minValuesRelaxed {
-			nodeClaim.Annotations[v1.NodeClaimMinValuesRelaxedAnnotationKey] = "true"
-		} else {
-			nodeClaim.Annotations[v1.NodeClaimMinValuesRelaxedAnnotationKey] = "false"
-		}
+		nodeClaim.Annotations[v1.NodeClaimMinValuesRelaxedAnnotationKey] = lo.Ternary(minValuesRelaxed, "true", "false")
+		tracing.SpanFromContext(newNodeClaimCtx).SetAttributes(attribute.Bool("minValuesRelaxed", minValuesRelaxed))
 
 		newNodeClaim = nodeClaim
 		updatedRequirements = r
 		updatedInstanceTypes = its
 		offeringsToReserve = ofs
 		idx = i
+		tracing.SpanFromContext(newNodeClaimCtx).AddEvent("updated new node claim for pod scheduling")
 		return false
 	})
 	if newNodeClaim != nil {
@@ -738,6 +805,10 @@ func (s *Scheduler) addToNewNodeClaim(ctx context.Context, pod *corev1.Pod) erro
 		newNodeClaim.Add(pod, s.cachedPodData[pod.UID], updatedRequirements, updatedInstanceTypes, offeringsToReserve)
 		s.newNodeClaims = append(s.newNodeClaims, newNodeClaim)
 		s.remainingResources[newNodeClaim.NodePoolName] = subtractMax(s.remainingResources[newNodeClaim.NodePoolName], newNodeClaim.InstanceTypeOptions)
+		tracing.SpanFromContext(ctx).AddEvent("successfully scheduled pod to new node claim", trace.WithAttributes(
+			attribute.Int("i", idx),
+			attribute.String("nodepool", newNodeClaim.NodePoolName),
+		))
 		return nil
 	}
 	return multierr.Combine(errs...)

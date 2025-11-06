@@ -39,6 +39,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/metrics"
 	"sigs.k8s.io/karpenter/pkg/operator/injection"
+	"sigs.k8s.io/karpenter/pkg/operator/tracing"
 	"sigs.k8s.io/karpenter/pkg/utils/resources"
 )
 
@@ -203,7 +204,7 @@ func (c *Controller) Register(_ context.Context, m manager.Manager) error {
 	return controllerruntime.NewControllerManagedBy(m).
 		Named(c.Name()).
 		WatchesRawSource(singleton.Source()).
-		Complete(singleton.AsReconciler(c))
+		Complete(tracing.WithObjectTracing[*corev1.Node](singleton.AsReconciler(c), c.Name()))
 }
 
 func buildClusterUtilizationMetric(nodes state.StateNodes) []*metrics.StoreMetric {

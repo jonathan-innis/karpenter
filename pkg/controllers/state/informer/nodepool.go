@@ -32,6 +32,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/operator/injection"
+	"sigs.k8s.io/karpenter/pkg/operator/tracing"
 	"sigs.k8s.io/karpenter/pkg/state/cost"
 	utilscontroller "sigs.k8s.io/karpenter/pkg/utils/controller"
 	nodepoolutils "sigs.k8s.io/karpenter/pkg/utils/nodepool"
@@ -85,5 +86,5 @@ func (c *NodePoolController) Register(ctx context.Context, m manager.Manager) er
 		For(&v1.NodePool{}, builder.WithPredicates(nodepoolutils.IsManagedPredicateFuncs(c.cloudProvider))).
 		WithOptions(controller.Options{MaxConcurrentReconciles: utilscontroller.LinearScaleReconciles(utilscontroller.CPUCount(ctx), minReconciles, maxReconciles)}).
 		WithEventFilter(predicate.GenerationChangedPredicate{}).
-		Complete(c)
+		Complete(tracing.WithObjectTracing[*v1.NodePool](reconcile.AsReconciler(m.GetClient(), c), c.Name()))
 }

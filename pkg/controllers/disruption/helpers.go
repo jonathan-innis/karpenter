@@ -22,6 +22,8 @@ import (
 	"strings"
 
 	"github.com/samber/lo"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/klog/v2"
@@ -30,6 +32,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	"sigs.k8s.io/karpenter/pkg/operator/options"
+	"sigs.k8s.io/karpenter/pkg/operator/tracing"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
@@ -51,6 +54,13 @@ var errCandidateDeleting = fmt.Errorf("candidate is deleting")
 func SimulateScheduling(ctx context.Context, kubeClient client.Client, cluster *state.Cluster, provisioner *provisioning.Provisioner, clk clock.Clock, recorder events.Recorder,
 	schedulerOpts []scheduling.Options, candidates ...*Candidate,
 ) (scheduling.Results, error) {
+	ctx = tracing.StartSpan(ctx, "SimulateScheduling", trace.WithAttributes(
+		attribute.Int("candidates.count", len(candidates)),
+		attribute.StringSlice("candidates.nodes", lo.Map(candidates, func(c *Candidate, _ int) string { return c.Node.Name })),
+		attribute.StringSlice("candidates.nodeclaims", lo.Map(candidates, func(c *Candidate, _ int) string { return c.NodeClaim.Name })),
+	))
+	defer tracing.EndSpan(ctx, err)
+
 	candidateNames := sets.NewString(lo.Map(candidates, func(t *Candidate, i int) string { return t.Name() })...)
 	nodes := cluster.DeepCopyNodes()
 	deletingNodes := nodes.Deleting()
@@ -61,9 +71,13 @@ func SimulateScheduling(ctx context.Context, kubeClient client.Client, cluster *
 	// We do one final check to ensure that the node that we are attempting to consolidate isn't
 	// already handled for deletion by some other controller. This could happen if the node was markedForDeletion
 	// between returning the candidates and getting the stateNodes above
-	if _, ok := lo.Find(deletingNodes, func(n *state.StateNode) bool {
+	if node, ok := lo.Find(deletingNodes, func(n *state.StateNode) bool {
 		return candidateNames.Has(n.Name())
 	}); ok {
+		tracing.SpanFromContext(ctx).AddEvent("candidate is deleting", trace.WithAttributes(
+			attribute.String("candidate.node", node.Node.Name),
+			attribute.String("candidate.nodeclaim", node.NodeClaim.Name)),
+		)
 		return scheduling.Results{}, errCandidateDeleting
 	}
 
@@ -173,7 +187,12 @@ func instanceTypesAreSubset(lhs []*cloudprovider.InstanceType, rhs []*cloudprovi
 // GetCandidates returns nodes that appear to be currently deprovisionable based off of their nodePool
 func GetCandidates(ctx context.Context, cluster *state.Cluster, kubeClient client.Client, recorder events.Recorder, clk clock.Clock,
 	cloudProvider cloudprovider.CloudProvider, shouldDisrupt CandidateFilter, disruptionClass string, queue *Queue,
-) ([]*Candidate, error) {
+) (candidates []*Candidate, err error) {
+	ctx = tracing.StartSpan(ctx, "GetCandidates", trace.WithAttributes(
+		attribute.Int("cluster.node.count", len(cluster.DeepCopyNodes()))),
+	)
+	defer tracing.EndSpan(ctx, err)
+
 	nodePoolMap, nodePoolToInstanceTypesMap, err := BuildNodePoolMap(ctx, kubeClient, cloudProvider)
 	if err != nil {
 		return nil, err
@@ -182,7 +201,7 @@ func GetCandidates(ctx context.Context, cluster *state.Cluster, kubeClient clien
 	if err != nil {
 		return nil, fmt.Errorf("tracking PodDisruptionBudgets, %w", err)
 	}
-	candidates := lo.FilterMap(cluster.DeepCopyNodes(), func(n *state.StateNode, _ int) (*Candidate, bool) {
+	candidates = lo.FilterMap(cluster.DeepCopyNodes(), func(n *state.StateNode, _ int) (*Candidate, bool) {
 		cn, e := NewCandidate(ctx, kubeClient, recorder, clk, n, pdbs, nodePoolMap, nodePoolToInstanceTypesMap, queue, disruptionClass)
 		return cn, e == nil
 	})

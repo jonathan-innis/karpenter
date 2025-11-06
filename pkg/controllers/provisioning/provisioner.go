@@ -29,6 +29,8 @@ import (
 	"github.com/awslabs/operatorpkg/serrors"
 	"github.com/awslabs/operatorpkg/singleton"
 	"github.com/awslabs/operatorpkg/status"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/samber/lo"
 	"go.uber.org/multierr"
@@ -44,6 +46,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 
 	"sigs.k8s.io/karpenter/pkg/operator/options"
+	"sigs.k8s.io/karpenter/pkg/operator/tracing"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
@@ -116,7 +119,7 @@ func (p *Provisioner) Register(_ context.Context, m manager.Manager) error {
 	return controllerruntime.NewControllerManagedBy(m).
 		Named(p.Name()).
 		WatchesRawSource(singleton.Source()).
-		Complete(singleton.AsReconciler(p))
+		Complete(tracing.WithTracing(singleton.AsReconciler(p), p.Name()))
 }
 
 func (p *Provisioner) Reconcile(ctx context.Context) (result reconciler.Result, err error) {
@@ -124,20 +127,28 @@ func (p *Provisioner) Reconcile(ctx context.Context) (result reconciler.Result, 
 
 	// Batch pods
 	if triggered := p.batcher.Wait(ctx); !triggered {
+		tracing.SpanFromContext(ctx).AddEvent("no pods triggered provisioning, requeuing")
 		return reconciler.Result{RequeueAfter: singleton.RequeueImmediately}, nil
 	}
 	// We need to ensure that our internal cluster state mechanism is synced before we proceed
 	// with making any scheduling decision off of our state nodes. Otherwise, we have the potential to make
 	// a scheduling decision based on a smaller subset of nodes in our cluster state than actually exist.
 	if !p.cluster.Synced(ctx) {
+		tracing.SpanFromContext(ctx).AddEvent("cluster not synced, requeuing")
 		return reconciler.Result{RequeueAfter: singleton.RequeueImmediately}, nil
 	}
+	tracing.SpanFromContext(ctx).AddEvent("cluster synced")
 
 	// Schedule pods to potential nodes, exit if nothing to do
 	results, err := p.Schedule(ctx)
 	if err != nil {
 		return reconciler.Result{}, err
 	}
+	tracing.SpanFromContext(ctx).SetAttributes(
+		attribute.Int("results.NewNodeClaims", len(results.NewNodeClaims)),
+		attribute.Int("results.ExistingNodes", len(results.ExistingNodes)),
+		attribute.Int("results.PodErrors", len(results.PodErrors)),
+	)
 	// Update CapacityBuffer state. Two things happen here:
 	// 1. Patch the Provisioning condition on each buffer (FitsExistingCapacity vs RequiresNewCapacity).
 	// 2. Update cluster.bufferPodCounts so the emptiness disruption path knows
@@ -151,11 +162,13 @@ func (p *Provisioner) Reconcile(ctx context.Context) (result reconciler.Result, 
 		p.cluster.UpdateBufferPodCounts(bufferPodCountsFromResults(results))
 	}
 	if len(results.NewNodeClaims) == 0 {
+		tracing.SpanFromContext(ctx).AddEvent("no new nodeclaims, requeuing")
 		return reconciler.Result{RequeueAfter: singleton.RequeueImmediately}, nil
 	}
 	if _, err = p.CreateNodeClaims(ctx, results.NewNodeClaims, WithReason(metrics.ProvisionedReason), RecordPodNomination); err != nil {
 		return reconciler.Result{}, err
 	}
+	tracing.SpanFromContext(ctx).AddEvent("nodeclaims created")
 	return reconciler.Result{RequeueAfter: singleton.RequeueImmediately}, nil
 }
 
@@ -258,20 +271,33 @@ func (p *Provisioner) NewScheduler(
 	pods []*corev1.Pod,
 	stateNodes []*state.StateNode,
 	opts ...scheduler.Options,
-) (*scheduler.Scheduler, error) {
+) (sched *scheduler.Scheduler, err error) {
+	ctx = tracing.StartSpan(ctx, "NewScheduler")
+	defer tracing.EndSpan(ctx, err)
+
 	nodePools, err := nodepoolutils.ListManaged(ctx, p.kubeClient, p.cloudProvider)
 	if err != nil {
 		return nil, fmt.Errorf("listing nodepools, %w", err)
 	}
 	nodePools = lo.Filter(nodePools, func(np *v1.NodePool, _ int) bool {
+		nodePoolCtx := tracing.StartSpan(ctx, "filterNodePools", trace.WithAttributes(
+			attribute.String("nodepool", klog.KObj(np).String()),
+		))
 		if nodepoolutils.IsStatic(np) {
+			tracing.EndSpan(nodePoolCtx, fmt.Errorf("ignoring static nodepool"))
 			return false
 		}
 		if !np.StatusConditions().IsTrue(status.ConditionReady) {
+			tracing.EndSpan(nodePoolCtx, fmt.Errorf("ignoring nodepool, not ready"))
 			log.FromContext(ctx).WithValues("NodePool", klog.KObj(np)).Error(err, "ignoring nodepool, not ready")
 			return false
 		}
-		return np.DeletionTimestamp.IsZero()
+		if !np.DeletionTimestamp.IsZero() {
+			tracing.EndSpan(nodePoolCtx, fmt.Errorf("ignoring nodepool, deletion timestamp is set"))
+			return false
+		}
+		tracing.EndSpan(nodePoolCtx, nil)
+		return true
 	})
 	if len(nodePools) == 0 {
 		return nil, ErrNodePoolsNotFound
@@ -284,22 +310,30 @@ func (p *Provisioner) NewScheduler(
 
 	instanceTypes := map[string][]*cloudprovider.InstanceType{}
 	for _, np := range nodePools {
+		nodePoolCtx := tracing.StartSpan(ctx, "getInstanceTypes", trace.WithAttributes(
+			attribute.String("nodepool", klog.KObj(np).String()),
+		))
 		its, err := p.cloudProvider.GetInstanceTypes(ctx, np)
 		if err != nil {
 			if cloudprovider.IsUnevaluatedNodePoolError(err) {
 				log.FromContext(ctx).WithValues("NodePool", klog.KObj(np)).V(1).Info("skipping, awaiting nodeoverlay evaluation")
+				tracing.EndSpan(nodePoolCtx, fmt.Errorf("skipping, awaiting nodeoverlay evaluation"))
 				continue
 			}
 			if errors.Is(err, context.DeadlineExceeded) {
 				return nil, fmt.Errorf("getting instance types, %w", err)
 			}
 			log.FromContext(ctx).WithValues("NodePool", klog.KObj(np)).Error(err, "skipping, unable to resolve instance types")
+			tracing.EndSpan(nodePoolCtx, fmt.Errorf("skipping, unable to resolve instance types"))
 			continue
 		}
 		if len(its) == 0 {
 			log.FromContext(ctx).WithValues("NodePool", klog.KObj(np)).Info("skipping, no resolved instance types found")
+			tracing.EndSpan(nodePoolCtx, fmt.Errorf("skipping, no resolved instance types found"))
 			continue
 		}
+		tracing.SpanFromContext(nodePoolCtx).AddEvent("retrieved instance types")
+		tracing.EndSpan(nodePoolCtx, nil)
 		instanceTypes[np.Name] = its
 	}
 
@@ -310,21 +344,26 @@ func (p *Provisioner) NewScheduler(
 	if err != nil {
 		return nil, fmt.Errorf("getting volume topology requirements, %w", err)
 	}
+	tracing.SpanFromContext(ctx).AddEvent("injected volume topology requirements into pod requirements")
 
 	// Calculate cluster topology, if a context error occurs, it is wrapped and returned
 	topology, err := scheduler.NewTopology(ctx, p.kubeClient, p.cluster, stateNodes, nodePools, instanceTypes, pods, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("tracking topology counts, %w", err)
 	}
+	tracing.SpanFromContext(ctx).AddEvent("constructed cluster topology")
 	daemonSetPods, err := p.getDaemonSetPods(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("getting daemon pods, %w", err)
 	}
+	tracing.SpanFromContext(ctx).AddEvent("retrieved daemon set pods")
 	// Pass volumeReqs to scheduler - added to nodeRequirements for NodeClaim zone selection
 	return scheduler.NewScheduler(ctx, p.kubeClient, nodePools, p.cluster, stateNodes, topology, instanceTypes, daemonSetPods, p.recorder, p.clock, volumeReqs, opts...), nil
 }
 
-func (p *Provisioner) Schedule(ctx context.Context) (scheduler.Results, error) {
+func (p *Provisioner) Schedule(ctx context.Context) (res scheduler.Results, err error) {
+	ctx = tracing.StartSpan(ctx, "Schedule")
+	defer tracing.EndSpan(ctx, err)
 	defer metrics.Measure(scheduler.DurationSeconds, map[string]string{scheduler.ControllerLabel: injection.GetControllerName(ctx)})()
 	start := time.Now()
 
@@ -344,6 +383,8 @@ func (p *Provisioner) Schedule(ctx context.Context) (scheduler.Results, error) {
 	if err != nil {
 		return scheduler.Results{}, err
 	}
+	tracing.SpanFromContext(ctx).SetAttributes(attribute.Int("pendingPods", len(pendingPods)))
+	tracing.SpanFromContext(ctx).AddEvent("retrieved pending pods")
 
 	// Get pods from nodes that are preparing for deletion
 	// We do this after getting the pending pods so that we undershoot if pods are
@@ -353,10 +394,13 @@ func (p *Provisioner) Schedule(ctx context.Context) (scheduler.Results, error) {
 	if err != nil {
 		return scheduler.Results{}, err
 	}
+	tracing.SpanFromContext(ctx).SetAttributes(attribute.Int("deletingNodePods", len(deletingNodePods)))
+	tracing.SpanFromContext(ctx).AddEvent("retrieved deleting node pods")
 
 	pods := append(pendingPods, deletingNodePods...)
 	// nothing to schedule, so just return success
 	if len(pods) == 0 {
+		tracing.SpanFromContext(ctx).AddEvent("no pods to schedule")
 		return scheduler.Results{}, nil
 	}
 	log.FromContext(ctx).V(1).WithValues("pending-pods", len(pendingPods), "deleting-pods", len(deletingNodePods)).Info("computing scheduling decision for provisionable pod(s)")
@@ -377,6 +421,7 @@ func (p *Provisioner) Schedule(ctx context.Context) (scheduler.Results, error) {
 	)
 	if err != nil {
 		if errors.Is(err, ErrNodePoolsNotFound) {
+			tracing.SpanFromContext(ctx).AddEvent("no dynamic nodepools found")
 			log.FromContext(ctx).Info("no dynamic nodepools found")
 			p.cluster.MarkPodSchedulingDecisions(ctx, lo.SliceToMap(pods, func(p *corev1.Pod) (*corev1.Pod, error) {
 				return p, fmt.Errorf("no dynamic nodepools found")
@@ -390,6 +435,7 @@ func (p *Provisioner) Schedule(ctx context.Context) (scheduler.Results, error) {
 	timeoutCtx, cancel := context.WithTimeout(ctx, time.Minute)
 	defer cancel()
 
+	tracing.SpanFromContext(ctx).AddEvent("solving scheduling decision...")
 	results, err := s.Solve(timeoutCtx, pods)
 	// context errors are ignored because we want to finish provisioning for what has already been scheduled
 	if err != nil && !errors.Is(err, context.DeadlineExceeded) {
@@ -398,6 +444,11 @@ func (p *Provisioner) Schedule(ctx context.Context) (scheduler.Results, error) {
 	results = results.TruncateInstanceTypes(ctx, scheduler.MaxInstanceTypes)
 	reservedOfferingErrors := results.ReservedOfferingErrors()
 	if len(reservedOfferingErrors) != 0 {
+		tracing.FromContext(ctx).SpanFromContext(ctx).AddEvent("deferring scheduling decision for provisionable pod(s) to future simulation due to limited reserved offering capacity", trace.WithAttributes(
+			attribute.StringSlice("pods", lo.Map(lo.Keys(reservedOfferingErrors), func(p *corev1.Pod, _ int) string {
+				return klog.KRef(p.Namespace, p.Name).String()
+			})),
+		))
 		log.FromContext(ctx).V(1).WithValues(
 			"Pods", pretty.Slice(lo.Map(lo.Keys(reservedOfferingErrors), func(p *corev1.Pod, _ int) string {
 				return klog.KRef(p.Namespace, p.Name).String()
@@ -412,6 +463,11 @@ func (p *Provisioner) Schedule(ctx context.Context) (scheduler.Results, error) {
 		},
 	)
 	if len(results.NewNodeClaims) > 0 {
+		tracing.SpanFromContext(ctx).AddEvent("found provisionable pod(s)", trace.WithAttributes(
+			attribute.StringSlice("pods", lo.Map(pods, func(p *corev1.Pod, _ int) string {
+				return klog.KObj(p).String()
+			})),
+		))
 		log.FromContext(ctx).WithValues(
 			"Pods", pretty.Slice(lo.Map(pods, func(p *corev1.Pod, _ int) string {
 				return klog.KObj(p).String()

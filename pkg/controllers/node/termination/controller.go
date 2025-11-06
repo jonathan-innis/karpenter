@@ -21,6 +21,8 @@ import (
 	"fmt"
 	"time"
 
+	"go.opentelemetry.io/otel/attribute"
+
 	"github.com/awslabs/operatorpkg/serrors"
 	"github.com/awslabs/operatorpkg/status"
 	"github.com/samber/lo"
@@ -54,6 +56,8 @@ import (
 	nodeutils "sigs.k8s.io/karpenter/pkg/utils/node"
 	"sigs.k8s.io/karpenter/pkg/utils/pod"
 	volumeutil "sigs.k8s.io/karpenter/pkg/utils/volume"
+
+	"sigs.k8s.io/karpenter/pkg/operator/tracing"
 )
 
 const (
@@ -83,6 +87,7 @@ func NewController(clk clock.Clock, kubeClient client.Client, cloudProvider clou
 }
 
 func (c *Controller) Reconcile(ctx context.Context, n *corev1.Node) (reconcile.Result, error) {
+	tracing.SpanFromContext(ctx).SetAttributes(attribute.String("node.name", n.Name))
 	if !n.GetDeletionTimestamp().IsZero() {
 		return c.finalize(ctx, n)
 	}
@@ -425,5 +430,5 @@ func (c *Controller) Register(ctx context.Context, m manager.Manager) error {
 				MaxConcurrentReconciles: maxConcurrentReconciles,
 			},
 		).
-		Complete(reconcile.AsReconciler(m.GetClient(), c))
+		Complete(tracing.WithObjectTracing[*corev1.Node](reconcile.AsReconciler(m.GetClient(), c), c.Name()))
 }

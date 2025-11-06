@@ -20,11 +20,14 @@ import (
 	"context"
 	stderrors "errors"
 	"fmt"
+	"strconv"
 	"time"
 
 	"github.com/awslabs/operatorpkg/serrors"
 	"github.com/awslabs/operatorpkg/status"
 	"github.com/samber/lo"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/multierr"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
@@ -42,6 +45,7 @@ import (
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/operator/options"
+	"sigs.k8s.io/karpenter/pkg/operator/tracing"
 	"sigs.k8s.io/karpenter/pkg/scheduling"
 	nodeutils "sigs.k8s.io/karpenter/pkg/utils/node"
 	"sigs.k8s.io/karpenter/pkg/utils/pdb"
@@ -180,6 +184,20 @@ func (in *StateNode) Name() string {
 		return in.NodeClaim.Name
 	}
 	return in.Node.Name
+}
+
+func (in *StateNode) NodeName() string {
+	if in.Node == nil {
+		return ""
+	}
+	return in.Node.Name
+}
+
+func (in *StateNode) NodeClaimName() string {
+	if in.NodeClaim == nil {
+		return ""
+	}
+	return in.NodeClaim.Name
 }
 
 // ProviderID is the key that is used to map this StateNode
@@ -482,12 +500,19 @@ func nominationWindow(ctx context.Context) time.Duration {
 // This is used to enforce no taints at the beginning of disruption, and
 // to add/remove taints while executing a disruption action.
 // nolint:gocyclo
-func RequireNoScheduleTaint(ctx context.Context, kubeClient client.Client, addTaint bool, nodes ...*StateNode) error {
+func RequireNoScheduleTaint(ctx context.Context, kubeClient client.Client, addTaint bool, nodes ...*StateNode) (err error) {
+	ctx = tracing.StartSpan(ctx, "RequireNoScheduleTaint", trace.WithAttributes(attribute.String("addTaint", strconv.FormatBool(addTaint)), attribute.StringSlice("nodes", lo.Map(nodes, func(node *StateNode, _ int) string { return node.NodeName() })), attribute.StringSlice("nodeclaims", lo.Map(nodes, func(node *StateNode, _ int) string { return node.NodeClaimName() }))))
+	defer tracing.EndSpan(ctx, err)
+
 	errs := make([]error, len(nodes))
 	workqueue.ParallelizeUntil(ctx, len(nodes), len(nodes), func(i int) {
+		nodeCtx := tracing.StartSpan(ctx, "removeNodeTaint", trace.WithAttributes(attribute.String("node.name", nodes[i].NodeName()), attribute.String("nodeclaim.name", nodes[i].NodeClaimName())))
+		defer tracing.EndSpan(nodeCtx, errs[i])
+
 		// If the StateNode is Karpenter owned and only has a nodeclaim, or is not owned by
 		// Karpenter, thus having no nodeclaim, don't touch the node.
 		if nodes[i].Node == nil || nodes[i].NodeClaim == nil {
+			tracing.SpanFromContext(nodeCtx).AddEvent("node or nodeclaim not found, skipping since we don't manage it")
 			return
 		}
 		node := &corev1.Node{}
@@ -536,9 +561,16 @@ func RequireNoScheduleTaint(ctx context.Context, kubeClient client.Client, addTa
 
 // ClearNodeClaimsCondition will remove the conditionType from the NodeClaim status of the provided statenodes
 func ClearNodeClaimsCondition(ctx context.Context, kubeClient client.Client, clk clock.Clock, conditionType string, nodes ...*StateNode) error {
+	ctx = tracing.StartSpan(ctx, "ClearNodeClaimsCondition", trace.WithAttributes(attribute.StringSlice("nodes", lo.Map(nodes, func(node *StateNode, _ int) string { return node.NodeName() })), attribute.StringSlice("nodeclaims", lo.Map(nodes, func(node *StateNode, _ int) string { return node.NodeClaimName() }))))
+	defer tracing.EndSpan(ctx, err)
+
 	errs := make([]error, len(nodes))
 	workqueue.ParallelizeUntil(ctx, len(nodes), len(nodes), func(i int) {
+		nodeCtx := tracing.StartSpan(ctx, "clearNodeClaimCondition", trace.WithAttributes(attribute.String("node.name", nodes[i].NodeName()), attribute.String("nodeclaim.name", nodes[i].NodeClaimName())))
+		defer tracing.EndSpan(nodeCtx, errs[i])
+
 		if !nodes[i].Initialized() || nodes[i].NodeClaim == nil {
+			tracing.SpanFromContext(nodeCtx).AddEvent("node or nodeclaim not initialized or not found, skipping since we don't manage it")
 			return
 		}
 		nodeClaim := &v1.NodeClaim{}

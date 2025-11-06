@@ -32,6 +32,7 @@ import (
 
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/operator/injection"
+	"sigs.k8s.io/karpenter/pkg/operator/tracing"
 	utilscontroller "sigs.k8s.io/karpenter/pkg/utils/controller"
 )
 
@@ -88,5 +89,5 @@ func (c *DaemonSetController) Register(ctx context.Context, m manager.Manager) e
 			},
 		}).
 		WithOptions(controller.Options{MaxConcurrentReconciles: utilscontroller.LinearScaleReconciles(utilscontroller.CPUCount(ctx), minReconciles, maxReconciles)}).
-		Complete(c)
+		Complete(tracing.WithObjectTracing[*appsv1.DaemonSet](c, c.Name()))
 }

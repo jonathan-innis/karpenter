@@ -21,6 +21,7 @@ import (
 	"context"
 	stderrors "errors"
 	"fmt"
+	"reflect"
 	"strings"
 	"sync"
 	"time"
@@ -32,6 +33,8 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/samber/lo"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/multierr"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/client-go/util/workqueue"
@@ -48,6 +51,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/events"
 	"sigs.k8s.io/karpenter/pkg/metrics"
 	"sigs.k8s.io/karpenter/pkg/operator/injection"
+	"sigs.k8s.io/karpenter/pkg/operator/tracing"
 	nodepoolutils "sigs.k8s.io/karpenter/pkg/utils/nodepool"
 	"sigs.k8s.io/karpenter/pkg/utils/pretty"
 )
@@ -119,7 +123,7 @@ func (c *Controller) Register(_ context.Context, m manager.Manager) error {
 	return controllerruntime.NewControllerManagedBy(m).
 		Named(c.Name()).
 		WatchesRawSource(singleton.Source()).
-		Complete(singleton.AsReconciler(c))
+		Complete(tracing.WithTracing(singleton.AsReconciler(c), c.Name()))
 }
 
 func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
@@ -138,8 +142,10 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 	// with making any scheduling decision off of our state nodes. Otherwise, we have the potential to make
 	// a scheduling decision based on a smaller subset of nodes in our cluster state than actually exist.
 	if !c.cluster.Synced(ctx) {
+		tracing.SpanFromContext(ctx).AddEvent("cluster not synced, requeuing")
 		return reconciler.Result{RequeueAfter: time.Second}, nil
 	}
+	tracing.SpanFromContext(ctx).AddEvent("cluster synced")
 
 	// Karpenter taints nodes with a karpenter.sh/disruption taint as part of the disruption process while it progresses in memory.
 	// If Karpenter restarts or fails with an error during a disruption action, some nodes can be left tainted.
@@ -147,12 +153,14 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 	outdatedNodes := lo.Reject(c.cluster.DeepCopyNodes(), func(s *state.StateNode, _ int) bool {
 		return c.queue.HasAny(s.ProviderID()) || s.MarkedForDeletion()
 	})
+	tracing.SpanFromContext(ctx).AddEvent(fmt.Sprintf("found %d outdated nodes, removing taints", len(outdatedNodes)))
 	if err := state.RequireNoScheduleTaint(ctx, c.kubeClient, false, outdatedNodes...); err != nil {
 		if errors.IsConflict(err) {
 			return reconciler.Result{Requeue: true}, nil
 		}
 		return reconciler.Result{}, serrors.Wrap(fmt.Errorf("removing taint from nodes, %w", err), "taint", pretty.Taint(v1.DisruptedNoScheduleTaint))
 	}
+	tracing.SpanFromContext(ctx).AddEvent(fmt.Sprintf("found %d outdated nodeclaims, clearing Disrupted condition", len(outdatedNodes)))
 	if err := state.ClearNodeClaimsCondition(ctx, c.kubeClient, c.clock, v1.ConditionTypeDisruptionReason, outdatedNodes...); err != nil {
 		if errors.IsConflict(err) {
 			return reconciler.Result{Requeue: true}, nil
@@ -162,24 +170,33 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 
 	// Attempt different disruption methods. We'll only let one method perform an action
 	for _, m := range c.methods {
+		methodCtx := tracing.StartSpan(ctx, reflect.TypeOf(m).Elem().Name(), trace.WithAttributes(attribute.String("ConsolidationType", m.ConsolidationType())))
+
 		c.recordRun(fmt.Sprintf("%T", m))
-		success, err := c.disrupt(ctx, m)
+		success, err := c.disrupt(methodCtx, m)
+		tracing.SpanFromContext(methodCtx).SetAttributes(attribute.Bool("success", success))
 		if err != nil {
+			tracing.EndSpan(methodCtx, err)
 			if errors.IsConflict(err) {
 				return reconciler.Result{Requeue: true}, nil
 			}
 			return reconciler.Result{}, serrors.Wrap(fmt.Errorf("disrupting, %w", err), strings.ToLower(string(m.Reason())), "reason")
 		}
+		tracing.EndSpan(methodCtx, nil)
 		if success {
 			return reconciler.Result{RequeueAfter: singleton.RequeueImmediately}, nil
 		}
 	}
+	tracing.SpanFromContext(ctx).AddEvent("no methods were able to disrupt, returning to requeue")
 
 	// All methods did nothing, so return nothing to do
 	return reconciler.Result{RequeueAfter: pollingPeriod}, nil
 }
 
-func (c *Controller) disrupt(ctx context.Context, disruption Method) (bool, error) {
+func (c *Controller) disrupt(ctx context.Context, disruption Method) (succeeded bool, err error) {
+	ctx = tracing.StartSpan(ctx, "disrupt")
+	defer tracing.EndSpan(ctx, err)
+
 	defer metrics.Measure(EvaluationDurationSeconds, map[string]string{
 		metrics.ReasonLabel:    strings.ToLower(string(disruption.Reason())),
 		ConsolidationTypeLabel: disruption.ConsolidationType(),
@@ -188,30 +205,49 @@ func (c *Controller) disrupt(ctx context.Context, disruption Method) (bool, erro
 	if err != nil {
 		return false, fmt.Errorf("determining candidates, %w", err)
 	}
+	tracing.SpanFromContext(ctx).SetAttributes(attribute.Int("candidates.count", len(candidates)))
+	tracing.SpanFromContext(ctx).AddEvent("retrieved candidates")
 	EligibleNodes.Set(float64(len(candidates)), map[string]string{
 		metrics.ReasonLabel: strings.ToLower(string(disruption.Reason())),
 	})
 
 	// If there are no candidates, move to the next disruption
 	if len(candidates) == 0 {
+		tracing.SpanFromContext(ctx).AddEvent("no candidates found, moving to next disruption method")
 		return false, nil
 	}
 	disruptionBudgetMapping, err := BuildDisruptionBudgetMapping(ctx, c.cluster, c.clock, c.kubeClient, c.cloudProvider, c.recorder, disruption.Reason())
 	if err != nil {
 		return false, fmt.Errorf("building disruption budgets, %w", err)
 	}
+	tracing.SpanFromContext(ctx).AddEvent("built disruption budget mapping")
 	// Determine the disruption action
 	cmds, err := disruption.ComputeCommands(ctx, disruptionBudgetMapping, candidates...)
 	if err != nil {
 		return false, fmt.Errorf("computing disruption decision, %w", err)
 	}
 	cmds = lo.Filter(cmds, func(c Command, _ int) bool { return c.Decision() != NoOpDecision })
+	tracing.SpanFromContext(ctx).SetAttributes(attribute.Int("commands.count", len(cmds)))
 	if len(cmds) == 0 {
+		tracing.SpanFromContext(ctx).AddEvent("no commands found, moving to next disruption method")
 		return false, nil
+	}
+	if len(cmds) == 1 {
+		tracing.SpanFromContext(ctx).AddEvent("computed command", trace.WithAttributes(
+			attribute.Int("candidates.count", len(cmds[0].Candidates)),
+			attribute.Int("replacements.count", len(cmds[0].Replacements)),
+			attribute.StringSlice("candidates.nodes", lo.Map(cmds[0].Candidates, func(c *Candidate, _ int) string { return c.Node.Name })),
+			attribute.StringSlice("candidates.nodeclaims", lo.Map(cmds[0].Candidates, func(c *Candidate, _ int) string { return c.NodeClaim.Name })),
+		))
+	} else {
+		tracing.SpanFromContext(ctx).AddEvent("computed commands")
 	}
 
 	errs := make([]error, len(cmds))
 	workqueue.ParallelizeUntil(ctx, len(cmds), len(cmds), func(i int) {
+		cmdCtx := tracing.StartSpan(ctx, "computeCommands.attemptDisruption", trace.WithAttributes(attribute.String("command.id", cmds[i].ID.String())))
+		defer tracing.EndSpan(cmdCtx, errs[i])
+
 		cmd := cmds[i]
 
 		// Assign common fields
@@ -220,7 +256,7 @@ func (c *Controller) disrupt(ctx context.Context, disruption Method) (bool, erro
 		cmd.Method = disruption
 
 		// Attempt to disrupt
-		if err := c.queue.StartCommand(ctx, &cmd); err != nil {
+		if err := c.queue.StartCommand(cmdCtx, &cmd); err != nil {
 			errs[i] = fmt.Errorf("disrupting candidates, %w", err)
 		}
 	})

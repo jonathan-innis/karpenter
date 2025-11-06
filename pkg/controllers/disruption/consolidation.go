@@ -24,6 +24,8 @@ import (
 	"time"
 
 	"github.com/samber/lo"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/utils/clock"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -38,6 +40,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/events"
 	"sigs.k8s.io/karpenter/pkg/operator/options"
+	"sigs.k8s.io/karpenter/pkg/operator/tracing"
 	"sigs.k8s.io/karpenter/pkg/scheduling"
 )
 
@@ -85,9 +88,16 @@ func (c *consolidation) markConsolidated() {
 }
 
 // ShouldDisrupt is a predicate used to filter candidates
-func (c *consolidation) ShouldDisrupt(_ context.Context, cn *Candidate) bool {
+func (c *consolidation) ShouldDisrupt(ctx context.Context, cn *Candidate) bool {
+	ctx = tracing.StartSpan(ctx, "ShouldDisrupt", trace.WithAttributes(
+		attribute.String("candidate.node", cn.Node.Name),
+		attribute.String("candidate.nodeclaim", cn.NodeClaim.Name),
+		attribute.String("candidate.nodepool", cn.NodePool.Name)),
+	)
+
 	// Disable consolidation for static NodePool
 	if cn.OwnedByStaticNodePool() {
+		tracing.EndSpan(ctx, fmt.Errorf("candidate is owned by a static nodepool"))
 		return false
 	}
 	// We need the following to know what the price of the instance for price comparison. If one of these doesn't exist, we can't
@@ -96,18 +106,22 @@ func (c *consolidation) ShouldDisrupt(_ context.Context, cn *Candidate) bool {
 	// 2. Capacity Type
 	// 3. Zone
 	if cn.instanceType == nil {
+		tracing.EndSpan(ctx, fmt.Errorf("instance type %q not found", cn.Labels()[corev1.LabelInstanceTypeStable]))
 		c.recorder.Publish(disruptionevents.Unconsolidatable(cn.Node, cn.NodeClaim, fmt.Sprintf("Instance Type %q not found", cn.Labels()[corev1.LabelInstanceTypeStable]))...)
 		return false
 	}
 	if _, ok := cn.Labels()[v1.CapacityTypeLabelKey]; !ok {
+		tracing.EndSpan(ctx, fmt.Errorf("node does not have label %q", v1.CapacityTypeLabelKey))
 		c.recorder.Publish(disruptionevents.Unconsolidatable(cn.Node, cn.NodeClaim, fmt.Sprintf("Node does not have label %q", v1.CapacityTypeLabelKey))...)
 		return false
 	}
 	if _, ok := cn.Labels()[corev1.LabelTopologyZone]; !ok {
+		tracing.EndSpan(ctx, fmt.Errorf("node does not have label %q", corev1.LabelTopologyZone))
 		c.recorder.Publish(disruptionevents.Unconsolidatable(cn.Node, cn.NodeClaim, fmt.Sprintf("Node does not have label %q", corev1.LabelTopologyZone))...)
 		return false
 	}
 	if cn.NodePool.Spec.Disruption.ConsolidateAfter.Duration == nil {
+		tracing.EndSpan(ctx, fmt.Errorf("nodepool %q has consolidation disabled", cn.NodePool.Name))
 		c.recorder.Publish(disruptionevents.Unconsolidatable(cn.Node, cn.NodeClaim, fmt.Sprintf("NodePool %q has consolidation disabled", cn.NodePool.Name))...)
 		return false
 	}
@@ -115,11 +129,17 @@ func (c *consolidation) ShouldDisrupt(_ context.Context, cn *Candidate) bool {
 	// we should also not fire an event here to users since this can be confusing when the field on the NodePool
 	// is named "consolidationPolicy"
 	if cn.NodePool.Spec.Disruption.ConsolidationPolicy != v1.ConsolidationPolicyWhenEmptyOrUnderutilized {
+		tracing.EndSpan(ctx, fmt.Errorf("nodepool %q has non-empty consolidation disabled", cn.NodePool.Name))
 		c.recorder.Publish(disruptionevents.Unconsolidatable(cn.Node, cn.NodeClaim, fmt.Sprintf("NodePool %q has non-empty consolidation disabled", cn.NodePool.Name))...)
 		return false
 	}
 	// return true if consolidatable
-	return cn.NodeClaim.StatusConditions().Get(v1.ConditionTypeConsolidatable).IsTrue()
+	if !cn.NodeClaim.StatusConditions().Get(v1.ConditionTypeConsolidatable).IsTrue() {
+		tracing.EndSpan(ctx, fmt.Errorf("candidate does not have the consolidatable condition"))
+		return false
+	}
+	tracing.EndSpan(ctx, nil)
+	return true
 }
 
 // sortCandidates sorts candidates by disruption cost (where the lowest disruption cost is first) and returns the result
@@ -133,13 +153,21 @@ func (c *consolidation) sortCandidates(candidates []*Candidate) []*Candidate {
 // computeConsolidation computes a consolidation action to take
 //
 // nolint:gocyclo
-func (c *consolidation) computeConsolidation(ctx context.Context, candidates ...*Candidate) (Command, error) {
-	var err error
+func (c *consolidation) computeConsolidation(ctx context.Context, candidates ...*Candidate) (cmd Command, err error) {
+	ctx = tracing.StartSpan(ctx, "computeConsolidation", trace.WithAttributes(
+		attribute.Int("candidates.count", len(candidates)),
+		attribute.StringSlice("candidates.nodes", lo.Map(candidates, func(c *Candidate, _ int) string { return c.Node.Name })),
+		attribute.StringSlice("candidates.nodeclaims", lo.Map(candidates, func(c *Candidate, _ int) string { return c.NodeClaim.Name })),
+		attribute.StringSlice("candidates.nodepools", lo.Map(candidates, func(c *Candidate, _ int) string { return c.NodePool.Name }))),
+	)
+	defer tracing.EndSpan(ctx, err)
+
 	// Run scheduling simulation to compute consolidation option
 	results, err := SimulateScheduling(ctx, c.kubeClient, c.cluster, c.provisioner, c.clock, c.recorder, []pscheduling.Options{pscheduling.IsConsolidationSimulation}, candidates...)
 	if err != nil {
 		// if a candidate node is now deleting, just retry
 		if errors.Is(err, errCandidateDeleting) {
+			tracing.SpanFromContext(ctx).AddEvent(fmt.Sprintf("candidate is deleting, %s", err.Error()))
 			return Command{}, nil
 		}
 		return Command{}, err
@@ -147,6 +175,7 @@ func (c *consolidation) computeConsolidation(ctx context.Context, candidates ...
 
 	// if not all of the pods were scheduled, we can't do anything
 	if !results.AllNonPendingPodsScheduled() {
+		tracing.SpanFromContext(ctx).AddEvent(fmt.Sprintf("not all non-pending pods were scheduled, %s", pretty.Sentence(results.NonPendingPodSchedulingErrors())))
 		// This method is used by multi-node consolidation as well, so we'll only report in the single node case
 		if len(candidates) == 1 {
 			c.recorder.Publish(disruptionevents.Unconsolidatable(candidates[0].Node, candidates[0].NodeClaim, pretty.Sentence(results.NonPendingPodSchedulingErrors()))...)
@@ -156,6 +185,9 @@ func (c *consolidation) computeConsolidation(ctx context.Context, candidates ...
 
 	// were we able to schedule all the pods on the inflight candidates?
 	if len(results.NewNodeClaims) == 0 {
+		tracing.SpanFromContext(ctx).AddEvent("found valid consolidation command", trace.WithAttributes(
+			attribute.Int("candidates.count", len(cmd.Candidates))),
+		)
 		return Command{
 			Candidates: candidates,
 			Results:    results,
@@ -164,6 +196,7 @@ func (c *consolidation) computeConsolidation(ctx context.Context, candidates ...
 
 	// we're not going to turn a single node into multiple candidates
 	if len(results.NewNodeClaims) != 1 {
+		tracing.SpanFromContext(ctx).AddEvent(fmt.Sprintf("can't remove without creating %d candidates", len(results.NewNodeClaims)))
 		if len(candidates) == 1 {
 			c.recorder.Publish(disruptionevents.Unconsolidatable(candidates[0].Node, candidates[0].NodeClaim, fmt.Sprintf("Can't remove without creating %d candidates", len(results.NewNodeClaims)))...)
 		}
@@ -180,6 +213,9 @@ func (c *consolidation) computeConsolidation(ctx context.Context, candidates ...
 			allExistingAreSpot = false
 		}
 	}
+	if allExistingAreSpot {
+		tracing.SpanFromContext(ctx).AddEvent("all existing candidates are spot")
+	}
 
 	// sort the instanceTypes by price before we take any actions like truncation for spot-to-spot consolidation or finding the nodeclaim
 	// that meets the minimum requirement after filteringByPrice
@@ -187,6 +223,7 @@ func (c *consolidation) computeConsolidation(ctx context.Context, candidates ...
 
 	if allExistingAreSpot &&
 		results.NewNodeClaims[0].Requirements.Get(v1.CapacityTypeLabelKey).Has(v1.CapacityTypeSpot) {
+		tracing.SpanFromContext(ctx).AddEvent("computing spot-to-spot consolidation")
 		return c.computeSpotToSpotConsolidation(ctx, candidates, results, candidatePrice)
 	}
 
@@ -196,12 +233,14 @@ func (c *consolidation) computeConsolidation(ctx context.Context, candidates ...
 	// causing churns and landing onto lower available spot instance ultimately resulting in higher interruptions.
 	results.NewNodeClaims[0], err = results.NewNodeClaims[0].RemoveInstanceTypeOptionsByPriceAndMinValues(results.NewNodeClaims[0].Requirements, candidatePrice)
 	if err != nil {
+		tracing.SpanFromContext(ctx).AddEvent(fmt.Sprintf("error filtering by price: %s", err.Error()))
 		if len(candidates) == 1 {
 			c.recorder.Publish(disruptionevents.Unconsolidatable(candidates[0].Node, candidates[0].NodeClaim, fmt.Sprintf("Filtering by price: %v", err))...)
 		}
 		return Command{}, nil
 	}
 	if len(results.NewNodeClaims[0].InstanceTypeOptions) == 0 {
+		tracing.SpanFromContext(ctx).AddEvent("can't replace with a cheaper node")
 		if len(candidates) == 1 {
 			c.recorder.Publish(disruptionevents.Unconsolidatable(candidates[0].Node, candidates[0].NodeClaim, "Can't replace with a cheaper node")...)
 		}
@@ -224,6 +263,10 @@ func (c *consolidation) computeConsolidation(ctx context.Context, candidates ...
 		Results:      results,
 	}
 	cmd.EmitCandidateEvents(c.recorder)
+	tracing.SpanFromContext(ctx).AddEvent("found valid consolidation command", trace.WithAttributes(
+		attribute.Int("candidates.count", len(cmd.Candidates)),
+		attribute.Int("replacements.count", len(results.NewNodeClaims))),
+	)
 
 	return cmd, nil
 }
@@ -233,10 +276,16 @@ func (c *consolidation) computeConsolidation(ctx context.Context, candidates ...
 //  2. For single-node consolidation:
 //     a. There are at least 15 cheapest instance type replacement options to consolidate.
 //     b. The current candidate is NOT part of the first 15 cheapest instance types inorder to avoid repeated consolidation.
-func (c *consolidation) computeSpotToSpotConsolidation(ctx context.Context, candidates []*Candidate, results pscheduling.Results, candidatePrice float64) (Command, error) {
+func (c *consolidation) computeSpotToSpotConsolidation(ctx context.Context, candidates []*Candidate, results pscheduling.Results, candidatePrice float64) (cmd Command, err error) {
+	ctx = tracing.StartSpan(ctx, "computeSpotToSpotConsolidation", trace.WithAttributes(
+		attribute.Int("candidates.count", len(candidates)),
+		attribute.Int("replacements.count", len(results.NewNodeClaims))),
+	)
+	defer tracing.EndSpan(ctx, err)
 
 	// Spot consolidation is turned off.
 	if !options.FromContext(ctx).FeatureGates.SpotToSpotConsolidation {
+		tracing.SpanFromContext(ctx).AddEvent("SpotToSpotConsolidation is disabled, can't replace a spot node with a spot node")
 		if len(candidates) == 1 {
 			c.recorder.Publish(disruptionevents.Unconsolidatable(candidates[0].Node, candidates[0].NodeClaim, "SpotToSpotConsolidation is disabled, can't replace a spot node with a spot node")...)
 		}
@@ -249,15 +298,16 @@ func (c *consolidation) computeSpotToSpotConsolidation(ctx context.Context, cand
 	results.NewNodeClaims[0].InstanceTypeOptions = results.NewNodeClaims[0].InstanceTypeOptions.Compatible(results.NewNodeClaims[0].Requirements)
 
 	// filterByPrice returns the instanceTypes that are lower priced than the current candidate and any error that indicates the input couldn't be filtered.
-	var err error
 	results.NewNodeClaims[0], err = results.NewNodeClaims[0].RemoveInstanceTypeOptionsByPriceAndMinValues(results.NewNodeClaims[0].Requirements, candidatePrice)
 	if err != nil {
+		tracing.SpanFromContext(ctx).AddEvent(fmt.Sprintf("error filtering by price: %s", err.Error()))
 		if len(candidates) == 1 {
 			c.recorder.Publish(disruptionevents.Unconsolidatable(candidates[0].Node, candidates[0].NodeClaim, fmt.Sprintf("Filtering by price: %v", err))...)
 		}
 		return Command{}, nil
 	}
 	if len(results.NewNodeClaims[0].InstanceTypeOptions) == 0 {
+		tracing.SpanFromContext(ctx).AddEvent("can't replace with a cheaper node")
 		if len(candidates) == 1 {
 			c.recorder.Publish(disruptionevents.Unconsolidatable(candidates[0].Node, candidates[0].NodeClaim, "Can't replace with a cheaper node")...)
 		}
@@ -273,6 +323,10 @@ func (c *consolidation) computeSpotToSpotConsolidation(ctx context.Context, cand
 			Results:      results,
 		}
 		cmd.EmitCandidateEvents(c.recorder)
+		tracing.SpanFromContext(ctx).AddEvent("found valid multi-node spot-to-spot consolidation command", trace.WithAttributes(
+			attribute.Int("candidates.count", len(candidates)),
+			attribute.Int("replacements.count", len(results.NewNodeClaims))),
+		)
 
 		return cmd, nil
 	}
@@ -283,6 +337,7 @@ func (c *consolidation) computeSpotToSpotConsolidation(ctx context.Context, cand
 	//   1) The current candidate is not in the set of the 15 cheapest instance types and
 	//   2) There were at least 15 options cheaper than the current candidate.
 	if len(results.NewNodeClaims[0].InstanceTypeOptions) < MinInstanceTypesForSpotToSpotConsolidation {
+		tracing.SpanFromContext(ctx).AddEvent(fmt.Sprintf("SpotToSpotConsolidation requires %d cheaper instance type options than the current candidate to consolidate, got %d", MinInstanceTypesForSpotToSpotConsolidation, len(results.NewNodeClaims[0].InstanceTypeOptions)))
 		c.recorder.Publish(disruptionevents.Unconsolidatable(candidates[0].Node, candidates[0].NodeClaim, fmt.Sprintf("SpotToSpotConsolidation requires %d cheaper instance type options than the current candidate to consolidate, got %d",
 			MinInstanceTypesForSpotToSpotConsolidation, len(results.NewNodeClaims[0].InstanceTypeOptions)))...)
 		return Command{}, nil
@@ -311,6 +366,10 @@ func (c *consolidation) computeSpotToSpotConsolidation(ctx context.Context, cand
 		Results:      results,
 	}
 	cmd.EmitCandidateEvents(c.recorder)
+	tracing.SpanFromContext(ctx).AddEvent("found valid single-node spot-to-spot consolidation command", trace.WithAttributes(
+		attribute.Int("candidates.count", len(candidates)),
+		attribute.Int("replacements.count", len(results.NewNodeClaims))),
+	)
 
 	return cmd, nil
 }

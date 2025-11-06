@@ -31,6 +31,7 @@ import (
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
+	"sigs.k8s.io/karpenter/pkg/operator/tracing"
 	"sigs.k8s.io/karpenter/pkg/state/cost"
 )
 
@@ -83,5 +84,5 @@ func (c *PricingController) Register(_ context.Context, m manager.Manager) error
 	return controllerruntime.NewControllerManagedBy(m).
 		Named(c.Name()).
 		WatchesRawSource(singleton.Source()).
-		Complete(singleton.AsReconciler(c))
+		Complete(tracing.WithTracing(singleton.AsReconciler(c), c.Name()))
 }

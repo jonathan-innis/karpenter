@@ -26,11 +26,13 @@ import (
 	"github.com/awslabs/operatorpkg/serrors"
 	"github.com/google/uuid"
 	"github.com/samber/lo"
+	"go.opentelemetry.io/otel/attribute"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/klog/v2"
 	"k8s.io/utils/clock"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
+	"sigs.k8s.io/karpenter/pkg/operator/tracing"
 	"sigs.k8s.io/karpenter/pkg/utils/pretty"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
@@ -89,6 +91,19 @@ func (c *Candidate) OwnedByStaticNodePool() bool {
 func NewCandidate(ctx context.Context, kubeClient client.Client, recorder events.Recorder, clk clock.Clock, node *state.StateNode, pdbs pdb.Limits,
 	nodePoolMap map[string]*v1.NodePool, nodePoolToInstanceTypesMap map[string]map[string]*cloudprovider.InstanceType, queue *Queue, disruptionClass string,
 ) (*Candidate, error) {
+	ctx = tracing.StartSpan(ctx, "NewCandidate")
+	defer tracing.EndSpan(ctx, err)
+
+	if node.Node != nil {
+		tracing.SpanFromContext(ctx).SetAttributes(attribute.String("candidate.node", node.Node.Name))
+	}
+	if node.NodeClaim != nil {
+		tracing.SpanFromContext(ctx).SetAttributes(attribute.String("candidate.nodeclaim", node.NodeClaim.Name))
+	}
+	if node.Labels()[v1.NodePoolLabelKey] != "" {
+		tracing.SpanFromContext(ctx).SetAttributes(attribute.String("candidate.nodepool", node.Labels()[v1.NodePoolLabelKey]))
+	}
+
 	var err error
 	var pods []*corev1.Pod
 	// If the orchestration queue is already considering a candidate we want to disrupt, don't consider it a candidate.
@@ -123,6 +138,7 @@ func NewCandidate(ctx context.Context, kubeClient client.Client, recorder events
 			return nil, err
 		}
 	}
+	tracing.SpanFromContext(ctx).AddEvent("created valid candidate")
 	return &Candidate{
 		StateNode:         node,
 		instanceType:      instanceType,

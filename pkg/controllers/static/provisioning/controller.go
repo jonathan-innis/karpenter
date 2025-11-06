@@ -35,16 +35,15 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
+	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
+	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/controllers/provisioning"
 	"sigs.k8s.io/karpenter/pkg/controllers/provisioning/scheduling"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/events"
 	"sigs.k8s.io/karpenter/pkg/metrics"
-
-	"sigs.k8s.io/karpenter/pkg/cloudprovider"
-
-	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/operator/injection"
+	"sigs.k8s.io/karpenter/pkg/operator/tracing"
 	nodepoolutils "sigs.k8s.io/karpenter/pkg/utils/nodepool"
 	"sigs.k8s.io/karpenter/pkg/utils/resources"
 )
@@ -158,7 +157,7 @@ func (c *Controller) Register(_ context.Context, m manager.Manager) error {
 			},
 		})).
 		WithOptions(controller.Options{MaxConcurrentReconciles: 10}).
-		Complete(reconcile.AsReconciler(m.GetClient(), c))
+		Complete(tracing.WithObjectTracing[*v1.NodePool](reconcile.AsReconciler(m.GetClient(), c), c.Name()))
 }
 
 func HasNodePoolReplicaOrStatusChanged(oldNP, newNP *v1.NodePool) bool {

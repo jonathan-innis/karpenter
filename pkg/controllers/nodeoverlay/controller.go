@@ -42,6 +42,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/operator/injection"
+	"sigs.k8s.io/karpenter/pkg/operator/tracing"
 	"sigs.k8s.io/karpenter/pkg/scheduling"
 )
 
@@ -157,7 +158,7 @@ func (c *Controller) Register(_ context.Context, m manager.Manager) error {
 		b.Watches(nodeClass, NodeOverlayEventHandler(c.kubeClient))
 	}
 
-	return b.Complete(c)
+	return b.Complete(tracing.WithObjectTracing[*v1alpha1.NodeOverlay](c, c.Name()))
 }
 
 func (c *Controller) validateAndUpdateInstanceTypeOverrides(temporaryStore *internalInstanceTypeStore, nodePoolList []v1.NodePool, nodePoolToInstanceTypes map[string][]*cloudprovider.InstanceType, overlay v1alpha1.NodeOverlay) bool {

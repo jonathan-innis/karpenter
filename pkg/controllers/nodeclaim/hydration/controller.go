@@ -21,6 +21,7 @@ import (
 
 	"github.com/awslabs/operatorpkg/reasonable"
 	"github.com/samber/lo"
+	"go.opentelemetry.io/otel/attribute"
 	"k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/klog/v2"
 	controllerruntime "sigs.k8s.io/controller-runtime"
@@ -35,6 +36,7 @@ import (
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/operator/injection"
+	"sigs.k8s.io/karpenter/pkg/operator/tracing"
 	utilscontroller "sigs.k8s.io/karpenter/pkg/utils/controller"
 	nodeclaimutils "sigs.k8s.io/karpenter/pkg/utils/nodeclaim"
 )
@@ -55,13 +57,22 @@ func NewController(kubeClient client.Client, cloudProvider cloudprovider.CloudPr
 
 func (c *Controller) Reconcile(ctx context.Context, nc *v1.NodeClaim) (reconcile.Result, error) {
 	ctx = injection.WithControllerName(ctx, c.Name())
+
+	tracing.SpanFromContext(ctx).SetAttributes(
+		attribute.String("nodeclaim.name", nc.Name),
+		attribute.String("nodeclaim.namespace", nc.Namespace),
+	)
+
 	if nc.Status.NodeName != "" {
+		tracing.SpanFromContext(ctx).SetAttributes(attribute.String("nodeclaim.node_name", nc.Status.NodeName))
 		ctx = log.IntoContext(ctx, log.FromContext(ctx).WithValues("Node", klog.KRef("", nc.Status.NodeName)))
 	}
 
 	if !nodeclaimutils.IsManaged(nc, c.cloudProvider) {
+		tracing.SpanFromContext(ctx).SetAttributes(attribute.Bool("nodeclaim.managed", false))
 		return reconcile.Result{}, nil
 	}
+	tracing.SpanFromContext(ctx).SetAttributes(attribute.Bool("nodeclaim.managed", true))
 
 	stored := nc.DeepCopy()
 	nc.Labels = lo.Assign(nc.Labels, map[string]string{
@@ -87,5 +98,5 @@ func (c *Controller) Register(ctx context.Context, m manager.Manager) error {
 			RateLimiter:             reasonable.RateLimiter(),
 			MaxConcurrentReconciles: utilscontroller.LinearScaleReconciles(utilscontroller.CPUCount(ctx), 1000, 5000),
 		}).
-		Complete(reconcile.AsReconciler(m.GetClient(), c))
+		Complete(tracing.WithObjectTracing[*v1.NodeClaim](reconcile.AsReconciler(m.GetClient(), c), c.Name()))
 }

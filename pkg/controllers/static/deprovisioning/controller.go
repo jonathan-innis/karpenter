@@ -46,6 +46,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/events"
 	"sigs.k8s.io/karpenter/pkg/operator/injection"
+	"sigs.k8s.io/karpenter/pkg/operator/tracing"
 	disruptionutils "sigs.k8s.io/karpenter/pkg/utils/disruption"
 	nodeclaimutils "sigs.k8s.io/karpenter/pkg/utils/nodeclaim"
 	nodepoolutils "sigs.k8s.io/karpenter/pkg/utils/nodepool"
@@ -171,7 +172,7 @@ func (c *Controller) Register(_ context.Context, m manager.Manager) error {
 			},
 		})).
 		WithOptions(controller.Options{MaxConcurrentReconciles: 10}).
-		Complete(reconcile.AsReconciler(m.GetClient(), c))
+		Complete(tracing.WithObjectTracing[*v1.NodePool](reconcile.AsReconciler(m.GetClient(), c), c.Name()))
 }
 
 func HasNodePoolReplicaCountChanged(oldNP, newNP *v1.NodePool) bool {

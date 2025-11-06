@@ -30,6 +30,7 @@ import (
 
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/operator/injection"
+	"sigs.k8s.io/karpenter/pkg/operator/tracing"
 	utilscontroller "sigs.k8s.io/karpenter/pkg/utils/controller"
 )
 
@@ -83,5 +84,5 @@ func (c *PodController) Register(ctx context.Context, m manager.Manager) error {
 		Named(c.Name()).
 		For(&v1.Pod{}).
 		WithOptions(controller.Options{MaxConcurrentReconciles: utilscontroller.LinearScaleReconciles(utilscontroller.CPUCount(ctx), minReconciles, maxReconciles)}).
-		Complete(c)
+		Complete(tracing.WithObjectTracing[*v1.Pod](c, c.Name()))
 }

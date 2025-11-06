@@ -11,7 +11,8 @@ additionalAnnotations: {}
 # -- Image pull policy for Docker images.
 imagePullPolicy: IfNotPresent
 # -- Image pull secrets for Docker images.
-imagePullSecrets: []
+imagePullSecrets:
+  - name: ecr-secret
 serviceAccount:
   # -- Specifies if a ServiceAccount should be created.
   create: true
@@ -55,7 +56,7 @@ terminationGracePeriodSeconds:
 # This is required when using a custom CNI.
 hostNetwork: false
 # -- Configure the DNS Policy for the pod
-dnsPolicy: Default
+dnsPolicy: ClusterFirst
 # -- Configure DNS Config for the pod
 dnsConfig: {}
 #  options:

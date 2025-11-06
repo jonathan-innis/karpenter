@@ -48,6 +48,7 @@ import (
 	terminatorevents "sigs.k8s.io/karpenter/pkg/controllers/node/termination/terminator/events"
 	"sigs.k8s.io/karpenter/pkg/events"
 	"sigs.k8s.io/karpenter/pkg/operator/injection"
+	"sigs.k8s.io/karpenter/pkg/operator/tracing"
 	utilscontroller "sigs.k8s.io/karpenter/pkg/utils/controller"
 	nodeutils "sigs.k8s.io/karpenter/pkg/utils/node"
 	podutils "sigs.k8s.io/karpenter/pkg/utils/pod"
@@ -133,7 +134,7 @@ func (q *Queue) Register(ctx context.Context, m manager.Manager) error {
 			),
 			MaxConcurrentReconciles: maxConcurrentReconciles,
 		}).
-		Complete(reconcile.AsReconciler(m.GetClient(), q))
+		Complete(tracing.WithObjectTracing[*corev1.Pod](reconcile.AsReconciler(m.GetClient(), q), q.Name()))
 }
 
 // Add adds pods to the Queue

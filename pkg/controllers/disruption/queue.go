@@ -27,6 +27,8 @@ import (
 	"github.com/awslabs/operatorpkg/serrors"
 	"github.com/awslabs/operatorpkg/status"
 	"github.com/samber/lo"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/multierr"
 	"golang.org/x/time/rate"
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -47,6 +49,7 @@ import (
 
 	pscheduling "sigs.k8s.io/karpenter/pkg/controllers/provisioning/scheduling"
 	operatorlogging "sigs.k8s.io/karpenter/pkg/operator/logging"
+	"sigs.k8s.io/karpenter/pkg/operator/tracing"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	disruptionevents "sigs.k8s.io/karpenter/pkg/controllers/disruption/events"
@@ -136,15 +139,17 @@ func (q *Queue) Register(ctx context.Context, m manager.Manager) error {
 			),
 			MaxConcurrentReconciles: utilscontroller.LinearScaleReconciles(utilscontroller.CPUCount(ctx), 100, 1000),
 		}).
-		Complete(reconcile.AsReconciler(m.GetClient(), q))
+		Complete(tracing.WithObjectTracing[*v1.NodeClaim](reconcile.AsReconciler(m.GetClient(), q), q.Name()))
 }
 
-func (q *Queue) Reconcile(ctx context.Context, nodeClaim *v1.NodeClaim) (reconcile.Result, error) {
+func (q *Queue) Reconcile(ctx context.Context, nodeClaim *v1.NodeClaim) (res reconcile.Result, err error) {
 	ctx = injection.WithControllerName(ctx, q.Name())
+
 	q.RLock()
 	cmd, exists := q.ProviderIDToCommand[nodeClaim.Status.ProviderID]
 	q.RUnlock()
 	if !exists {
+		tracing.SpanFromContext(ctx).AddEvent("command not found for nodeclaim")
 		log.FromContext(ctx).Error(fmt.Errorf("no command found"), "")
 		return reconcile.Result{}, nil
 	}
@@ -153,6 +158,7 @@ func (q *Queue) Reconcile(ctx context.Context, nodeClaim *v1.NodeClaim) (reconci
 	if err := q.waitOrTerminate(ctx, cmd); err != nil {
 		// If recoverable, re-queue and try again.
 		if !IsUnrecoverableError(err) {
+			tracing.SpanFromContext(ctx).AddEvent(fmt.Sprintf("command is not ready, requeueing, %s", err.Error()))
 			return reconcile.Result{RequeueAfter: queueBaseDelay}, nil
 		}
 		// If the command failed, bail on the action.
@@ -171,8 +177,10 @@ func (q *Queue) Reconcile(ctx context.Context, nodeClaim *v1.NodeClaim) (reconci
 		multiErr := multierr.Combine(err, state.RequireNoScheduleTaint(ctx, q.kubeClient, false, stateNodes...))
 		multiErr = multierr.Combine(multiErr, state.ClearNodeClaimsCondition(ctx, q.kubeClient, q.clock, v1.ConditionTypeDisruptionReason, stateNodes...))
 		// Log the error
+		tracing.SpanFromContext(ctx).AddEvent(fmt.Sprintf("failed waiting for replacmenets or terminating nodes while executing a disruption command, %s", multiErr.Error()))
 		log.FromContext(ctx).Error(multiErr, "failed terminating nodes while executing a disruption command")
 	} else {
+		tracing.SpanFromContext(ctx).AddEvent("command succeeded")
 		log.FromContext(ctx).V(1).Info("command succeeded")
 		cmd.Succeeded = true
 	}
@@ -184,9 +192,17 @@ func (q *Queue) Reconcile(ctx context.Context, nodeClaim *v1.NodeClaim) (reconci
 // Once the replacements are ready, it will terminate the candidates.
 // nolint:gocyclo
 func (q *Queue) waitOrTerminate(ctx context.Context, cmd *Command) (err error) {
+	ctx = tracing.StartSpan(ctx, "waitOrTerminate", trace.WithAttributes(
+		attribute.Int("candidates.count", len(cmd.Candidates)),
+		attribute.Int("replacements.count", len(cmd.Replacements)),
+		attribute.String("command.id", cmd.ID.String()),
+	))
+	defer tracing.EndSpan(ctx, err)
+
 	// We use the number of commands in the queue as a proxy for cloud provider traffic.
 	// As the number of commands increase, we expect more delays and scale the retry duration accordingly.
 	retryDuration := q.GetMaxRetryDuration()
+	tracing.SpanFromContext(ctx).SetAttributes(attribute.String("retryDuration", retryDuration.String()))
 	// Wrap an error in an unrecoverable error if it timed out
 	defer func() {
 		if q.clock.Since(cmd.CreationTimestamp) > retryDuration {
@@ -195,8 +211,14 @@ func (q *Queue) waitOrTerminate(ctx context.Context, cmd *Command) (err error) {
 	}()
 	waitErrs := make([]error, len(cmd.Replacements))
 	for i := range cmd.Replacements {
+		replacementCtx := tracing.StartSpan(ctx, "waitOrTerminate.waitReplacement", trace.WithAttributes(
+			attribute.String("replacement.name", cmd.Replacements[i].Name),
+		))
+
 		// If we know the node claim is Initialized, no need to check again.
 		if cmd.Replacements[i].Initialized {
+			tracing.SpanFromContext(replacementCtx).AddEvent("replacement is already initialized, skipping")
+			tracing.EndSpan(replacementCtx, nil)
 			continue
 		}
 		// Get the nodeclaim
@@ -209,6 +231,7 @@ func (q *Queue) waitOrTerminate(ctx context.Context, cmd *Command) (err error) {
 				return NewUnrecoverableError(fmt.Errorf("replacement was deleted, %w", err))
 			}
 			waitErrs[i] = fmt.Errorf("getting node claim, %w", err)
+			tracing.EndSpan(replacementCtx, waitErrs[i])
 			continue
 		}
 		// We emitted this event when disruption was blocked on launching/termination.
@@ -218,8 +241,11 @@ func (q *Queue) waitOrTerminate(ctx context.Context, cmd *Command) (err error) {
 		if !initializedStatus.IsTrue() {
 			q.recorder.Publish(disruptionevents.WaitingOnReadiness(nodeClaim))
 			waitErrs[i] = serrors.Wrap(fmt.Errorf("nodeclaim not initialized"), "NodeClaim", klog.KRef("", nodeClaim.Name))
+			tracing.EndSpan(replacementCtx, waitErrs[i])
 			continue
 		}
+		tracing.SpanFromContext(replacementCtx).AddEvent("replacement is initialized")
+		tracing.EndSpan(replacementCtx, nil)
 		cmd.Replacements[i].Initialized = true
 	}
 	// If we have any errors, don't continue
@@ -231,7 +257,15 @@ func (q *Queue) waitOrTerminate(ctx context.Context, cmd *Command) (err error) {
 	// All we need to do now is get a successful delete call for each node claim,
 	// then the termination controller will handle the eventual deletion of the nodes.
 	errs := make([]error, len(cmd.Candidates))
+	tracing.SpanFromContext(ctx).AddEvent("all replacements initialized, deleting candidates")
 	workqueue.ParallelizeUntil(ctx, len(cmd.Candidates), len(cmd.Candidates), func(i int) {
+		candidateCtx := tracing.StartSpan(ctx, "waitOrTerminate.deleteCandidate", trace.WithAttributes(
+			attribute.String("candidate.node", cmd.Candidates[i].Node.Name),
+			attribute.String("candidate.nodeclaim", cmd.Candidates[i].NodeClaim.Name),
+			attribute.String("candidate.nodepool", cmd.Candidates[i].NodePool.Name),
+		))
+		defer tracing.EndSpan(candidateCtx, errs[i])
+
 		if err := retry.OnError(retry.DefaultBackoff, func(err error) bool { return client.IgnoreNotFound(err) != nil }, func() error {
 			return q.kubeClient.Delete(ctx, cmd.Candidates[i].NodeClaim)
 		}); err != nil {
@@ -244,6 +278,7 @@ func (q *Queue) waitOrTerminate(ctx context.Context, cmd *Command) (err error) {
 			metrics.NodePoolLabel:     cmd.Candidates[i].NodeClaim.Labels[v1.NodePoolLabelKey],
 			metrics.CapacityTypeLabel: cmd.Candidates[i].NodeClaim.Labels[v1.CapacityTypeLabelKey],
 		})
+		tracing.SpanFromContext(candidateCtx).AddEvent("candidate deleted")
 	})
 	// If there were any deletion failures, we should requeue.
 	// In the case where we requeue, but the timeout for the command is reached, we'll mark this as a failure.
@@ -252,9 +287,19 @@ func (q *Queue) waitOrTerminate(ctx context.Context, cmd *Command) (err error) {
 
 // markDisrupted taints the node and adds the Disrupted condition to the NodeClaim for a candidate that is about to be disrupted
 // For static NodeClaims, we mark NodeClaims as pendingdisruption in statenodepool
-func (q *Queue) markDisrupted(ctx context.Context, cmd *Command) ([]*Candidate, error) {
+func (q *Queue) markDisrupted(ctx context.Context, cmd *Command) (markedCandidates []*Candidate, err error) {
+	ctx = tracing.StartSpan(ctx, "markDisrupted")
+	defer tracing.EndSpan(ctx, err)
+
 	errs := make([]error, len(cmd.Candidates))
 	workqueue.ParallelizeUntil(ctx, len(cmd.Candidates), len(cmd.Candidates), func(i int) {
+		candidateCtx := tracing.StartSpan(ctx, "markDisrupted.taintCandidate", trace.WithAttributes(
+			attribute.String("candidate.node", cmd.Candidates[i].Node.Name),
+			attribute.String("candidate.nodeclaim", cmd.Candidates[i].NodeClaim.Name),
+			attribute.String("candidate.nodepool", cmd.Candidates[i].NodePool.Name),
+		))
+		defer tracing.EndSpan(candidateCtx, errs[i])
+
 		if err := state.RequireNoScheduleTaint(ctx, q.kubeClient, true, cmd.Candidates[i].StateNode); err != nil {
 			errs[i] = serrors.Wrap(fmt.Errorf("tainting nodes, %w", err), "taint", pretty.Taint(v1.DisruptedNoScheduleTaint))
 			return
@@ -273,7 +318,6 @@ func (q *Queue) markDisrupted(ctx context.Context, cmd *Command) ([]*Candidate, 
 			return
 		}
 	})
-	var markedCandidates []*Candidate
 	for i := range errs {
 		if errs[i] != nil {
 			continue
@@ -289,11 +333,20 @@ func (q *Queue) markDisrupted(ctx context.Context, cmd *Command) ([]*Candidate, 
 }
 
 // createReplacementNodeClaims creates replacement NodeClaims
-func (q *Queue) createReplacementNodeClaims(ctx context.Context, cmd *Command) error {
+func (q *Queue) createReplacementNodeClaims(ctx context.Context, cmd *Command) (err error) {
+	ctx = tracing.StartSpan(ctx, "createReplacementNodeClaims", trace.WithAttributes(
+		attribute.Int("replacements.count", len(cmd.Replacements)),
+		attribute.String("command.id", cmd.ID.String()),
+	))
+	defer tracing.EndSpan(ctx, err)
+
 	nodeClaimNames, err := q.provisioner.CreateNodeClaims(ctx, lo.Map(cmd.Replacements, func(r *Replacement, _ int) *pscheduling.NodeClaim { return r.NodeClaim }), provisioning.WithReason(strings.ToLower(string(cmd.Reason()))))
 	if err != nil {
 		return err
 	}
+	tracing.SpanFromContext(ctx).AddEvent("created replacement nodeclaims", trace.WithAttributes(
+		attribute.StringSlice("replacements.nodeclaims", nodeClaimNames),
+	))
 	if len(nodeClaimNames) != len(cmd.Replacements) {
 		// shouldn't ever occur since a partially failed CreateNodeClaims should return an error
 		return serrors.Wrap(fmt.Errorf("expected replacement count did not equal actual replacement count"), "expected-count", len(cmd.Replacements), "actual-count", len(nodeClaimNames))
@@ -308,7 +361,14 @@ func (q *Queue) createReplacementNodeClaims(ctx context.Context, cmd *Command) e
 // 1. Taint candidate nodes
 // 2. Spin up replacement nodes
 // 3. Add Command to the queue to wait to delete the candidates.
-func (q *Queue) StartCommand(ctx context.Context, cmd *Command) error {
+func (q *Queue) StartCommand(ctx context.Context, cmd *Command) (err error) {
+	ctx = tracing.StartSpan(ctx, "StartCommand", trace.WithAttributes(
+		attribute.Int("candidates.count", len(cmd.Candidates)),
+		attribute.Int("replacements.count", len(cmd.Replacements)),
+		attribute.String("command.id", cmd.ID.String()),
+	))
+	defer tracing.EndSpan(ctx, err)
+
 	// First check if we can add the command.
 	providerIDs := lo.Map(cmd.Candidates, func(c *Candidate, _ int) string {
 		return c.ProviderID()
@@ -327,6 +387,12 @@ func (q *Queue) StartCommand(ctx context.Context, cmd *Command) error {
 	// with disrupting the candidates. If it's just a delete operation, we can proceed
 	if markDisruptedErr != nil && (len(cmd.Replacements) > 0 || len(markedCandidates) == 0) {
 		return serrors.Wrap(fmt.Errorf("marking disrupted, %w", markDisruptedErr), "command-id", cmd.ID)
+	}
+	if len(markedCandidates) != len(cmd.Candidates) {
+		tracing.SpanFromContext(ctx).AddEvent(fmt.Sprintf("some candidates failed to be marked for disruption, deletion command so proceeding with deletion, %s", markDisruptedErr.Error()), trace.WithAttributes(
+			attribute.Int("candidates.count", len(cmd.Candidates)),
+			attribute.Int("candidates.markedDisrupted.count", len(markedCandidates)),
+		))
 	}
 
 	// Update the command to only consider the successfully MarkDisrupted candidates

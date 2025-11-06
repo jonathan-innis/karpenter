@@ -40,6 +40,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/metrics"
 	"sigs.k8s.io/karpenter/pkg/operator/injection"
+	"sigs.k8s.io/karpenter/pkg/operator/tracing"
 	podutils "sigs.k8s.io/karpenter/pkg/utils/pod"
 )
 
@@ -457,5 +458,5 @@ func (c *Controller) Register(_ context.Context, m manager.Manager) error {
 	return controllerruntime.NewControllerManagedBy(m).
 		Named(c.Name()).
 		For(&corev1.Pod{}).
-		Complete(c)
+		Complete(tracing.WithObjectTracing[*corev1.Pod](c, c.Name()))
 }

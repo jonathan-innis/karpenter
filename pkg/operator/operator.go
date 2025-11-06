@@ -62,6 +62,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/operator/injection"
 	"sigs.k8s.io/karpenter/pkg/operator/logging"
 	"sigs.k8s.io/karpenter/pkg/operator/options"
+	"sigs.k8s.io/karpenter/pkg/operator/tracing"
 	"sigs.k8s.io/karpenter/pkg/utils/env"
 )
 
@@ -101,6 +102,7 @@ type Operator struct {
 	EventRecorder       events.Recorder
 	Clock               clock.Clock
 	InstanceTypeStore   *nodeoverlay.InstanceTypeStore
+	tracerShutdown      func(context.Context) error
 }
 
 type Options struct {
@@ -167,6 +169,25 @@ func NewOperator(o ...option.Function[Options]) (context.Context, *Operator) {
 
 	log.FromContext(ctx).WithValues("version", Version).V(1).Info("discovered karpenter version")
 
+	// Setup Tracing
+	var tracer tracing.Tracer
+	var tracerShutdown func(context.Context) error
+	if options.FromContext(ctx).EnableTracing {
+		if options.FromContext(ctx).TracingEndpoint == "" {
+			panic("tracing endpoint must be specified when tracing is enabled")
+		}
+		var err error
+		tracer, tracerShutdown, err = tracing.NewOTELTracer(ctx, AppName, options.FromContext(ctx).TracingEndpoint)
+		if err != nil {
+			panic(fmt.Sprintf("failed to initialize tracer: %v", err))
+		}
+		log.FromContext(ctx).WithValues("endpoint", options.FromContext(ctx).TracingEndpoint).Info("tracing enabled")
+	} else {
+		tracer = tracing.NewNopTracer()
+		tracerShutdown = func(context.Context) error { return nil }
+	}
+	ctx = tracing.NewContext(ctx, tracer)
+
 	// Manager
 	mgrOpts := ctrl.Options{
 		Logger:                        logging.IgnoreDebugEvents(logger),
@@ -184,6 +205,7 @@ func NewOperator(o ...option.Function[Options]) (context.Context, *Operator) {
 		BaseContext: func() context.Context {
 			ctx := log.IntoContext(context.Background(), logger)
 			ctx = injection.WithOptionsOrDie(ctx, options.Injectables...)
+			ctx = tracing.NewContext(ctx, tracer)
 			return ctx
 		},
 		Cache: cache.Options{
@@ -248,6 +270,7 @@ func NewOperator(o ...option.Function[Options]) (context.Context, *Operator) {
 		EventRecorder:       events.NewRecorder(mgr.GetEventRecorderFor(AppName)), //nolint:staticcheck // SA1019: will be replaced by mgr.GetEventRecorder once events.Recorder is updated
 		Clock:               clock.RealClock{},
 		InstanceTypeStore:   instanceTypeStore,
+		tracerShutdown:      tracerShutdown,
 	}
 }
 
@@ -264,6 +287,9 @@ func (o *Operator) Start(ctx context.Context) {
 		lo.Must0(o.Manager.Start(ctx))
 	})
 	wg.Wait()
+	if err := o.tracerShutdown(ctx); err != nil {
+		log.FromContext(ctx).Error(err, "failed to shutdown tracer")
+	}
 }
 
 func setupIndexers(ctx context.Context, mgr manager.Manager) {

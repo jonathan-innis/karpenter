@@ -27,6 +27,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/state/nodepoolhealth"
 
 	"sigs.k8s.io/karpenter/pkg/operator/injection"
+	"sigs.k8s.io/karpenter/pkg/operator/tracing"
 
 	controllerruntime "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
@@ -66,7 +67,6 @@ func (c *Controller) Name() string {
 //nolint:gocyclo
 func (c *Controller) Reconcile(ctx context.Context, nodePool *v1.NodePool) (reconcile.Result, error) {
 	ctx = injection.WithControllerName(ctx, c.Name())
-
 	nodeClass, err := nodepoolutils.GetNodeClass(ctx, c.kubeClient, nodePool, c.cloudProvider)
 	if err != nil {
 		return reconcile.Result{}, client.IgnoreNotFound(err)
@@ -119,5 +119,5 @@ func (c *Controller) Register(ctx context.Context, m manager.Manager) error {
 	for _, nodeClass := range c.cloudProvider.GetSupportedNodeClasses() {
 		b.Watches(nodeClass, nodepoolutils.NodeClassEventHandler(c.kubeClient))
 	}
-	return b.Complete(reconcile.AsReconciler(m.GetClient(), c))
+	return b.Complete(tracing.WithObjectTracing[*v1.NodePool](reconcile.AsReconciler(m.GetClient(), c), c.Name()))
 }

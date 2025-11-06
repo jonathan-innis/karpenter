@@ -25,10 +25,13 @@ import (
 
 	"github.com/awslabs/operatorpkg/option"
 	"github.com/samber/lo"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
+	"sigs.k8s.io/karpenter/pkg/operator/tracing"
 	scheduler "sigs.k8s.io/karpenter/pkg/scheduling"
 )
 
@@ -50,7 +53,11 @@ func NewMultiNodeConsolidation(c consolidation, opts ...option.Function[MethodOp
 
 // nolint:gocyclo
 func (m *MultiNodeConsolidation) ComputeCommands(ctx context.Context, disruptionBudgetMapping map[string]int, candidates ...*Candidate) ([]Command, error) {
+	ctx = tracing.StartSpan(ctx, "ComputeCommands", trace.WithAttributes(attribute.Int("candidates.count", len(candidates))))
+	defer tracing.EndSpan(ctx, err)
+
 	if m.IsConsolidated() {
+		tracing.SpanFromContext(ctx).AddEvent("cluster has been recently consolidated so exiting early")
 		return []Command{}, nil
 	}
 	candidates = m.sortCandidates(candidates)
@@ -65,22 +72,35 @@ func (m *MultiNodeConsolidation) ComputeCommands(ctx context.Context, disruption
 	disruptableCandidates := make([]*Candidate, 0, len(candidates))
 	constrainedByBudgets := false
 	for _, candidate := range candidates {
+		candidateCtx := tracing.StartSpan(ctx, "ComputeCommands.filterCandidates", trace.WithAttributes(
+			attribute.String("candidate.node", candidate.Node.Name),
+			attribute.String("candidate.nodeclaim", candidate.NodeClaim.Name),
+			attribute.String("candidate.nodepool", candidate.NodePool.Name),
+			attribute.Int("candidate.reschedulablePods", len(candidate.reschedulablePods)),
+			attribute.Int("candidate.remainingBudget", disruptionBudgetMapping[candidate.NodePool.Name])),
+		)
 		// If there's disruptions allowed for the candidate's nodepool,
 		// add it to the list of candidates, and decrement the budget.
 		if disruptionBudgetMapping[candidate.NodePool.Name] == 0 {
 			constrainedByBudgets = true
+			tracing.SpanFromContext(candidateCtx).AddEvent("candidate is constrained by budgets")
+			tracing.EndSpan(candidateCtx, nil)
 			continue
 		}
 		// Filter out empty candidates. If there was an empty node that wasn't consolidated before this, we should
 		// assume that it was due to budgets. If we don't filter out budgets, users who set a budget for `empty`
 		// can find their nodes disrupted here.
 		if len(candidate.reschedulablePods) == 0 {
+			tracing.SpanFromContext(candidateCtx).AddEvent("candidate is empty")
+			tracing.EndSpan(candidateCtx, nil)
 			continue
 		}
 		// set constrainedByBudgets to true if any node was a candidate but was constrained by a budget
 		disruptableCandidates = append(disruptableCandidates, candidate)
 		disruptionBudgetMapping[candidate.NodePool.Name]--
+		tracing.EndSpan(candidateCtx, nil)
 	}
+	tracing.SpanFromContext(ctx).SetAttributes(attribute.Bool("constrainedByBudgets", constrainedByBudgets))
 
 	// Only consider a maximum batch of 100 NodeClaims to save on computation.
 	// This could be further configurable in the future.
@@ -98,32 +118,45 @@ func (m *MultiNodeConsolidation) ComputeCommands(ctx context.Context, disruption
 		if !constrainedByBudgets {
 			m.markConsolidated()
 		}
+		tracing.SpanFromContext(ctx).AddEvent("no valid multi-node consolidation commands found")
 		return []Command{}, nil
 	}
 
 	if cmd, err = m.validator.Validate(ctx, cmd, commandValidationDelay); err != nil {
 		if IsValidationError(err) {
 			reason := getValidationFailureReason(err)
+			tracing.SpanFromContext(ctx).AddEvent(fmt.Sprintf("abandoning multi-node consolidation attempt due to pod churn, command is no longer valid, %s", err))
 			cmd.EmitRejectedEvents(m.recorder, reason)
 			return []Command{}, nil
 		}
 		return []Command{}, fmt.Errorf("validating consolidation, %w", err)
 	}
+	tracing.SpanFromContext(ctx).AddEvent("found valid multi-node consolidation command", trace.WithAttributes(
+		attribute.Int("candidates.count", len(cmd.Candidates)),
+		attribute.Int("replacements.count", len(cmd.Replacements))),
+	)
 	return []Command{cmd}, nil
 }
 
 // firstNConsolidationOption looks at the first N NodeClaims to determine if they can all be consolidated at once.  The
 // NodeClaims are sorted by increasing disruption order which correlates to likelihood of being able to consolidate the node
 // nolint:gocyclo
-func (m *MultiNodeConsolidation) firstNConsolidationOption(ctx context.Context, candidates []*Candidate, max int) (Command, error) {
+func (m *MultiNodeConsolidation) firstNConsolidationOption(ctx context.Context, candidates []*Candidate, max int) (cmd Command, err error) {
+	ctx = tracing.StartSpan(ctx, "firstNConsolidationOption", trace.WithAttributes(
+		attribute.Int("candidates.count", len(candidates))),
+	)
+	defer tracing.EndSpan(ctx, err)
+
 	// we always operate on at least two NodeClaims at once, for single NodeClaims standard consolidation will find all solutions
 	if len(candidates) < 2 {
+		tracing.SpanFromContext(ctx).AddEvent("less than two candidates so exiting early")
 		return Command{}, nil
 	}
 	min := 1
 	if len(candidates) <= max {
 		max = len(candidates) - 1
 	}
+	tracing.SpanFromContext(ctx).SetAttributes(attribute.Int("min", min), attribute.Int("max", max))
 
 	lastSavedCommand := Command{}
 	// Set a timeout
@@ -131,6 +164,7 @@ func (m *MultiNodeConsolidation) firstNConsolidationOption(ctx context.Context, 
 	defer cancel()
 	for min <= max {
 		mid := (min + max) / 2
+		tracing.SpanFromContext(ctx).SetAttributes(attribute.Int("mid", mid))
 		candidatesToConsolidate := candidates[0 : mid+1]
 
 		// Pass the timeout context to ensure sub-operations can be canceled
@@ -140,9 +174,14 @@ func (m *MultiNodeConsolidation) firstNConsolidationOption(ctx context.Context, 
 			if errors.Is(err, context.DeadlineExceeded) {
 				ConsolidationTimeoutsTotal.Inc(map[string]string{ConsolidationTypeLabel: m.ConsolidationType()})
 				if lastSavedCommand.Candidates == nil {
+					tracing.SpanFromContext(ctx).AddEvent("failed to find a multi-node consolidation after timeout, last considered batch had no candidates")
 					log.FromContext(ctx).V(1).Info("failed to find a multi-node consolidation after timeout", "last_batch_size", (min+max)/2)
 					return Command{}, nil
 				}
+				tracing.SpanFromContext(ctx).AddEvent("stopping multi-node consolidation after timeout, returning last valid command", trace.WithAttributes(
+					attribute.Int("candidates.count", len(lastSavedCommand.Candidates)),
+					attribute.Int("replacements.count", len(lastSavedCommand.Replacements))),
+				)
 				log.FromContext(ctx).V(1).WithValues(lastSavedCommand.LogValues()...).Info("stopping multi-node consolidation after timeout, returning last valid command")
 				return lastSavedCommand, nil
 
@@ -160,12 +199,25 @@ func (m *MultiNodeConsolidation) firstNConsolidationOption(ctx context.Context, 
 			}
 		}
 		if validDecision {
+			tracing.SpanFromContext(ctx).AddEvent(fmt.Sprintf("found valid consolidation command from [0, %d], expanding to [0, %d]", mid, (max+(mid+1))/2), trace.WithAttributes(
+				attribute.Int("candidates.count", len(cmd.Candidates)),
+				attribute.Int("replacements.count", len(cmd.Replacements))),
+			)
 			// We can consolidate NodeClaims [0,mid]
 			lastSavedCommand = cmd
 			min = mid + 1
 		} else {
+			tracing.SpanFromContext(ctx).AddEvent(fmt.Sprintf("did not find valid consolidation command from [0, %d], reducing to [0, %d]", mid, (min+mid-1)/2))
 			max = mid - 1
 		}
+	}
+	if len(lastSavedCommand.Candidates) > 0 {
+		tracing.SpanFromContext(ctx).AddEvent("completed binary search for multi-node consolidation, returning last saved command", trace.WithAttributes(
+			attribute.Int("candidates.count", len(lastSavedCommand.Candidates)),
+			attribute.Int("replacements.count", len(lastSavedCommand.Replacements))),
+		)
+	} else {
+		tracing.SpanFromContext(ctx).AddEvent("completed binary search for multi-node consolidation, failed to find a multi-node consolidation")
 	}
 	return lastSavedCommand, nil
 }

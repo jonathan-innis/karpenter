@@ -21,6 +21,8 @@ import (
 	"fmt"
 	"time"
 
+	"go.opentelemetry.io/otel/attribute"
+
 	"github.com/awslabs/operatorpkg/reasonable"
 	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
@@ -48,6 +50,8 @@ import (
 	utilscontroller "sigs.k8s.io/karpenter/pkg/utils/controller"
 	nodeutils "sigs.k8s.io/karpenter/pkg/utils/node"
 	"sigs.k8s.io/karpenter/pkg/utils/pretty"
+
+	"sigs.k8s.io/karpenter/pkg/operator/tracing"
 )
 
 var allowedUnhealthyPercent = intstr.FromString("20%")
@@ -104,11 +108,12 @@ func (c *Controller) Register(ctx context.Context, m manager.Manager) error {
 			RateLimiter:             reasonable.RateLimiter(),
 			MaxConcurrentReconciles: utilscontroller.LinearScaleReconciles(utilscontroller.CPUCount(ctx), 10, 1000),
 		}).
-		Complete(reconcile.AsReconciler(m.GetClient(), c))
+		Complete(tracing.WithObjectTracing[*corev1.Node](reconcile.AsReconciler(m.GetClient(), c), c.Name()))
 }
 
 func (c *Controller) Reconcile(ctx context.Context, node *corev1.Node) (reconcile.Result, error) {
 	ctx = injection.WithControllerName(ctx, c.Name())
+	tracing.SpanFromContext(ctx).SetAttributes(attribute.String("node.name", node.Name))
 
 	// Validate that the node is owned by us
 	nodeClaim, err := nodeutils.NodeClaimForNode(ctx, c.kubeClient, node)

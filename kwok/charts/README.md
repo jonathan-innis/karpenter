@@ -28,12 +28,12 @@ For full Karpenter documentation please checkout [https://karpenter.sh](https://
 | controller.sidecarContainer | list | `[]` | Additional sidecarContainer config |
 | controller.sidecarVolumeMounts | list | `[]` | Additional volumeMounts for the sidecar - this will be added to the volume mounts on top of extraVolumeMounts |
 | dnsConfig | object | `{}` | Configure DNS Config for the pod |
-| dnsPolicy | string | `"Default"` | Configure the DNS Policy for the pod |
+| dnsPolicy | string | `"ClusterFirst"` | Configure the DNS Policy for the pod |
 | extraVolumes | list | `[]` | Additional volumes for the pod. |
 | fullnameOverride | string | `""` | Overrides the chart's computed fullname. |
 | hostNetwork | bool | `false` | Bind the pod to the host network. This is required when using a custom CNI. |
 | imagePullPolicy | string | `"IfNotPresent"` | Image pull policy for Docker images. |
-| imagePullSecrets | list | `[]` | Image pull secrets for Docker images. |
+| imagePullSecrets | list | `[{"name":"ecr-secret"}]` | Image pull secrets for Docker images. |
 | logLevel | string | `"info"` | Global log level, defaults to 'info' |
 | nameOverride | string | `""` | Overrides the chart's name. |
 | nodeSelector | object | `{"kubernetes.io/os":"linux"}` | Node selectors to schedule the pod to nodes with labels. |

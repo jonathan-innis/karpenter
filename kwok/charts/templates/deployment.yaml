@@ -84,6 +84,11 @@ spec:
               value: "{{ .Values.controller.metrics.port }}"
             - name: HEALTH_PROBE_PORT
               value: "{{ .Values.controller.healthProbe.port }}"
+            # OpenTelemetry environment variables
+            - name: ENABLE_TRACING
+              value: "true"
+            - name: TRACING_ENDPOINT
+              value: "otel-collector.default:4317"
             - name: SYSTEM_NAMESPACE
               valueFrom:
                 fieldRef:
